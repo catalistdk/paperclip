@@ -7,7 +7,7 @@ export const budgetPolicies = pgTable(
     id: uuid("id").primaryKey().defaultRandom(),
     companyId: uuid("company_id").notNull().references(() => companies.id),
     scopeType: text("scope_type").notNull(),
-    scopeId: uuid("scope_id").notNull(),
+    scopeId: text("scope_id").notNull(),
     metric: text("metric").notNull().default("billed_cents"),
     windowKind: text("window_kind").notNull(),
     amount: integer("amount").notNull().default(0),

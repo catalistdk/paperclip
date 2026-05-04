@@ -185,6 +185,64 @@ function isClosedIssueStatus(status: string | null | undefined): status is "done
   return status === "done" || status === "cancelled";
 }
 
+function isScraperQaAgent(agent: { role?: unknown; name?: unknown } | null | undefined) {
+  const role = typeof agent?.role === "string" ? agent.role.toLowerCase() : "";
+  const name = typeof agent?.name === "string" ? agent.name.toLowerCase() : "";
+  return role.includes("scraper qa") || name.includes("scraper qa");
+}
+
+function isScraperPassCloseAttempt(input: {
+  requestedStatus: unknown;
+  commentBody: unknown;
+  actorType: string;
+}) {
+  if (input.actorType !== "agent") return false;
+  if (input.requestedStatus !== "done") return false;
+  if (typeof input.commentBody !== "string") return false;
+  return /\b(qa\s+passed|scraper\s+pass|pass(?:ed)?)\b/i.test(input.commentBody);
+}
+
+function getMissingQaThreeLayerEvidence(commentBody: string) {
+  const checks: Array<[string, RegExp]> = [
+    ["`qa_three_layer.py` command/output marker", /qa_three_layer\.py|\[qa_three_layer\]/i],
+    ["`THREE-LAYER QA REPORT` header", /THREE-LAYER QA REPORT/i],
+    ["Layer 1 PASS line", /Layer 1 \(Scraper CSV\):\s+\[PASS\]/i],
+    ["Layer 2 PASS line", /Layer 2 \(DB parity\):\s+\[PASS\]/i],
+    ["Layer 3 PASS line", /Layer 3 \(WebUI render\):\s+\[PASS\]/i],
+    ["`Overall: PASSED` line", /Overall:\s+PASSED/i],
+  ];
+  return checks.filter(([, pattern]) => !pattern.test(commentBody)).map(([label]) => label);
+}
+
+async function assertScraperQaPassEvidence(input: {
+  res: Response;
+  actorType: string;
+  actorAgentId: string | null | undefined;
+  requestedStatus: unknown;
+  commentBody: unknown;
+  agentsSvc: ReturnType<typeof agentService>;
+}) {
+  if (!isScraperPassCloseAttempt({
+    actorType: input.actorType,
+    requestedStatus: input.requestedStatus,
+    commentBody: input.commentBody,
+  })) return true;
+
+  const actorAgent = input.actorAgentId ? await input.agentsSvc.getById(input.actorAgentId) : null;
+  if (!isScraperQaAgent(actorAgent)) return true;
+
+  const missing = getMissingQaThreeLayerEvidence(input.commentBody as string);
+  if (missing.length === 0) return true;
+
+  input.res.status(422).json({
+    error: "Scraper QA PASS comments must include qa_three_layer.py evidence before the issue can be marked done",
+    missingEvidence: missing,
+    requiredEvidence:
+      "Paste the qa_three_layer.py output including [qa_three_layer], THREE-LAYER QA REPORT, Layer 1/2/3 [PASS], and Overall: PASSED.",
+  });
+  return false;
+}
+
 function shouldImplicitlyMoveCommentedIssueToTodo(input: {
   issueStatus: string | null | undefined;
   assigneeAgentId: string | null | undefined;
@@ -2010,6 +2068,14 @@ export function issueRoutes(
     if (normalizedAssigneeAgentId !== undefined) {
       updateFields.assigneeAgentId = normalizedAssigneeAgentId;
     }
+    if (!(await assertScraperQaPassEvidence({
+      res,
+      actorType: req.actor.type,
+      actorAgentId: actor.agentId,
+      requestedStatus: updateFields.status,
+      commentBody,
+      agentsSvc,
+    }))) return;
 
     const transition = applyIssueExecutionPolicyTransition({
       issue: existing,

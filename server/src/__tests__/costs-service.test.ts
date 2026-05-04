@@ -57,6 +57,7 @@ const mockCostService = vi.hoisted(() => ({
   byAgentModel: vi.fn().mockResolvedValue([]),
   byProvider: vi.fn().mockResolvedValue([]),
   byBiller: vi.fn().mockResolvedValue([]),
+  byAdapter: vi.fn().mockResolvedValue([]),
   windowSpend: vi.fn().mockResolvedValue([]),
   byProject: vi.fn().mockResolvedValue([]),
 }));
@@ -395,6 +396,7 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
         agentId,
         projectId,
         provider: "openai",
+        adapterType: "codex_local",
         biller: "openai",
         billingType: "metered_api",
         model: "gpt-5",
@@ -409,6 +411,7 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
         agentId,
         projectId,
         provider: "openai",
+        adapterType: "codex_local",
         biller: "openai",
         billingType: "metered_api",
         model: "gpt-5",
@@ -428,11 +431,86 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
     const [byAgentRow] = await costs.byAgent(companyId, range);
     const [byProjectRow] = await costs.byProject(companyId, range);
     const [byAgentModelRow] = await costs.byAgentModel(companyId, range);
+    const [byAdapterRow] = await costs.byAdapter(companyId, range);
 
     expect(byAgentRow?.costCents).toBe(4_000_000_000);
     expect(byAgentRow?.inputTokens).toBe(4_000_000_000);
     expect(byProjectRow?.costCents).toBe(4_000_000_000);
     expect(byAgentModelRow?.costCents).toBe(4_000_000_000);
+    expect(byAdapterRow?.adapterType).toBe("codex_local");
+    expect(byAdapterRow?.costCents).toBe(4_000_000_000);
+  });
+
+  it("keeps Codex and Claude spend in separate adapter buckets", async () => {
+    const companyId = randomUUID();
+    const codexAgentId = randomUUID();
+    const claudeAgentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values([
+      {
+        id: codexAgentId,
+        companyId,
+        name: "Codex Agent",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: claudeAgentId,
+        companyId,
+        name: "Claude Agent",
+        role: "engineer",
+        status: "active",
+        adapterType: "claude_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+
+    await costs.createEvent(companyId, {
+      agentId: codexAgentId,
+      provider: "openai",
+      biller: "openai",
+      billingType: "metered_api",
+      model: "gpt-5.5",
+      inputTokens: 100,
+      cachedInputTokens: 0,
+      outputTokens: 20,
+      costCents: 75,
+      occurredAt: new Date("2026-05-03T10:00:00.000Z"),
+    });
+    await costs.createEvent(companyId, {
+      agentId: claudeAgentId,
+      provider: "anthropic",
+      biller: "anthropic",
+      billingType: "metered_api",
+      model: "claude-sonnet-4.5",
+      inputTokens: 100,
+      cachedInputTokens: 0,
+      outputTokens: 20,
+      costCents: 40,
+      occurredAt: new Date("2026-05-03T10:01:00.000Z"),
+    });
+
+    const rows = await costs.byAdapter(companyId, {
+      from: new Date("2026-05-01T00:00:00.000Z"),
+      to: new Date("2026-05-31T23:59:59.999Z"),
+    });
+
+    expect(rows).toEqual([
+      expect.objectContaining({ adapterType: "codex_local", costCents: 75, agentCount: 1 }),
+      expect.objectContaining({ adapterType: "claude_local", costCents: 40, agentCount: 1 }),
+    ]);
   });
 
   it("aggregates finance event sums above int32 without raising Postgres integer overflow", async () => {

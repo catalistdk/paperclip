@@ -29,9 +29,14 @@ console.log(JSON.stringify({ type: "turn.completed", usage: { input_tokens: 1, c
   await fs.chmod(commandPath, 0o755);
 }
 
-async function writeFailingCodexCommand(commandPath: string, errorMessage: string): Promise<void> {
+async function writeFailingCodexCommand(
+  commandPath: string,
+  errorMessage: string,
+  options?: { stderr?: string },
+): Promise<void> {
   const script = `#!/usr/bin/env node
 console.log(JSON.stringify({ type: "error", message: ${JSON.stringify(errorMessage)} }));
+${options?.stderr ? `console.error(${JSON.stringify(options.stderr)});` : ""}
 process.exit(1);
 `;
   await fs.writeFile(commandPath, script, "utf8");
@@ -421,6 +426,57 @@ describe("codex execute", () => {
       expect(result.errorCode).toBe("codex_transient_upstream");
       expect(result.errorFamily).toBe("transient_upstream");
       expect(result.errorMessage).toContain("high demand");
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("copies Codex JSON error output into stderr diagnostics when process stderr is empty", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-execute-diagnostics-"));
+    const workspace = path.join(root, "workspace");
+    const commandPath = path.join(root, "codex");
+    await fs.mkdir(workspace, { recursive: true });
+    await writeFailingCodexCommand(
+      commandPath,
+      "OAuth token expired: invalid_token from OpenAI API",
+    );
+
+    const previousHome = process.env.HOME;
+    process.env.HOME = root;
+
+    try {
+      const result = await execute({
+        runId: "run-codex-diagnostics",
+        agent: {
+          id: "agent-1",
+          companyId: "company-1",
+          name: "Codex Coder",
+          adapterType: "codex_local",
+          adapterConfig: {},
+        },
+        runtime: {
+          sessionId: null,
+          sessionParams: null,
+          sessionDisplayId: null,
+          taskKey: null,
+        },
+        config: {
+          command: commandPath,
+          cwd: workspace,
+          promptTemplate: "Follow the paperclip heartbeat.",
+        },
+        context: {},
+        authToken: "run-jwt-token",
+        onLog: async () => {},
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.errorCode).toBeNull();
+      expect(result.errorMessage).toContain("invalid_token");
+      expect(result.resultJson?.stderr).toContain("OAuth token expired");
+      expect(result.resultJson?.stdout).toContain("OAuth token expired");
     } finally {
       if (previousHome === undefined) delete process.env.HOME;
       else process.env.HOME = previousHome;

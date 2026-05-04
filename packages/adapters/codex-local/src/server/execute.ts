@@ -70,6 +70,15 @@ function firstNonEmptyLine(text: string): string {
   );
 }
 
+function buildCodexFailureStderr(stderr: string, fallbackErrorMessage: string): string {
+  const parts: string[] = [];
+  const trimmedStderr = stderr.trim();
+  const trimmedMessage = fallbackErrorMessage.trim();
+  if (trimmedStderr) parts.push(trimmedStderr);
+  if (trimmedMessage && !trimmedStderr.includes(trimmedMessage)) parts.push(trimmedMessage);
+  return parts.length > 0 ? parts.join("\n") : stderr;
+}
+
 function hasNonEmptyEnvValue(env: Record<string, string>, key: string): boolean {
   const raw = env[key];
   return typeof raw === "string" && raw.trim().length > 0;
@@ -726,8 +735,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       parsedError ||
       stderrLine ||
       `Codex exited with code ${attempt.proc.exitCode ?? -1}`;
+    const failed = (attempt.proc.exitCode ?? 0) !== 0;
+    const diagnosticStderr = failed
+      ? buildCodexFailureStderr(attempt.proc.stderr, fallbackErrorMessage)
+      : attempt.proc.stderr;
     const transientRetryNotBefore =
-      (attempt.proc.exitCode ?? 0) !== 0
+      failed
         ? extractCodexRetryNotBefore({
             stdout: attempt.proc.stdout,
             stderr: attempt.proc.stderr,
@@ -735,7 +748,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           })
         : null;
     const transientUpstream =
-      (attempt.proc.exitCode ?? 0) !== 0 &&
+      failed &&
       isCodexTransientUpstreamError({
         stdout: attempt.proc.stdout,
         stderr: attempt.proc.stderr,
@@ -747,7 +760,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       signal: attempt.proc.signal,
       timedOut: false,
       errorMessage:
-        (attempt.proc.exitCode ?? 0) === 0
+        !failed
           ? null
           : fallbackErrorMessage,
       errorCode:
@@ -767,7 +780,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       costUsd: null,
       resultJson: {
         stdout: attempt.proc.stdout,
-        stderr: attempt.proc.stderr,
+        stderr: diagnosticStderr,
         ...(transientUpstream ? { errorFamily: "transient_upstream" } : {}),
         ...(transientRetryNotBefore ? { retryNotBefore: transientRetryNotBefore.toISOString() } : {}),
         ...(transientRetryNotBefore ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),

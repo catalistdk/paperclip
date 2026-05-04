@@ -23,6 +23,8 @@ import type {
 } from "@paperclipai/shared";
 import { notFound, unprocessable } from "../errors.js";
 import { logActivity } from "./activity-log.js";
+import { logger } from "../middleware/logger.js";
+import { loadP0AlertConfigFromEnv } from "./p0-alerts.js";
 
 type ScopeRecord = {
   companyId: string;
@@ -78,7 +80,12 @@ function normalizeScopeName(scopeType: BudgetScopeType, name: string) {
   return name.trim().length > 0 ? name : scopeType;
 }
 
-async function resolveScopeRecord(db: Db, scopeType: BudgetScopeType, scopeId: string): Promise<ScopeRecord> {
+async function resolveScopeRecord(
+  db: Db,
+  scopeType: BudgetScopeType,
+  scopeId: string,
+  companyId?: string,
+): Promise<ScopeRecord> {
   if (scopeType === "company") {
     const row = await db
       .select({
@@ -120,6 +127,38 @@ async function resolveScopeRecord(db: Db, scopeType: BudgetScopeType, scopeId: s
     };
   }
 
+  if (scopeType === "adapter_type") {
+    if (!companyId) throw unprocessable("adapter_type budget scopes require a company");
+    const row = await db
+      .select({
+        id: companies.id,
+        name: companies.name,
+      })
+      .from(companies)
+      .where(eq(companies.id, companyId))
+      .then((rows) => rows[0] ?? null);
+    if (!row) throw notFound("Company not found");
+
+    const pausedAgents = await db
+      .select({ id: agents.id })
+      .from(agents)
+      .where(
+        and(
+          eq(agents.companyId, companyId),
+          eq(agents.adapterType, scopeId),
+          eq(agents.status, "paused"),
+          eq(agents.pauseReason, "budget"),
+        ),
+      );
+
+    return {
+      companyId: row.id,
+      name: `Adapter type ${scopeId}`,
+      paused: pausedAgents.length > 0,
+      pauseReason: pausedAgents.length > 0 ? "budget" : null,
+    };
+  }
+
   const row = await db
     .select({
       companyId: projects.companyId,
@@ -148,6 +187,9 @@ async function computeObservedAmount(
   const conditions = [eq(costEvents.companyId, policy.companyId)];
   if (policy.scopeType === "agent") conditions.push(eq(costEvents.agentId, policy.scopeId));
   if (policy.scopeType === "project") conditions.push(eq(costEvents.projectId, policy.scopeId));
+  if (policy.scopeType === "adapter_type") {
+    conditions.push(eq(costEvents.adapterType, policy.scopeId));
+  }
   const { start, end } = resolveWindow(policy.windowKind as BudgetWindowKind);
   if (policy.windowKind === "calendar_month_utc") {
     conditions.push(gte(costEvents.occurredAt, start));
@@ -187,6 +229,53 @@ function buildApprovalPayload(input: {
     policyId: input.policy.id,
     guidance: "Raise the budget and resume the scope, or keep the scope paused.",
   };
+}
+
+function formatBudgetThresholdAlert(input: {
+  policy: PolicyRow;
+  scopeName: string;
+  thresholdType: BudgetThresholdType;
+  amountObserved: number;
+  windowStart: Date;
+  windowEnd: Date;
+}) {
+  const utilizationPercent =
+    input.policy.amount > 0
+      ? Number(((input.amountObserved / input.policy.amount) * 100).toFixed(1))
+      : 0;
+  const severity = input.thresholdType === "hard" ? "P0" : "P1";
+  return [
+    `${severity}: ${input.scopeName} monthly budget ${utilizationPercent.toFixed(1)}%`,
+    `Scope: ${input.policy.scopeType}:${input.policy.scopeId}`,
+    `Spend: ${input.amountObserved.toLocaleString()} / ${input.policy.amount.toLocaleString()} cents`,
+    `Window: ${input.windowStart.toISOString()} to ${input.windowEnd.toISOString()}`,
+    input.thresholdType === "hard"
+      ? "Action: raise the budget and resume, or keep the scope paused."
+      : "Action: monitor burn rate before the 100% hard-stop.",
+  ].join("\n");
+}
+
+async function sendBudgetThresholdTelegram(input: {
+  policy: PolicyRow;
+  scopeName: string;
+  thresholdType: BudgetThresholdType;
+  amountObserved: number;
+  windowStart: Date;
+  windowEnd: Date;
+}) {
+  const config = loadP0AlertConfigFromEnv();
+  if (!config.telegramBotToken || !config.telegramChatId) return false;
+
+  await fetch(`https://api.telegram.org/bot${encodeURIComponent(config.telegramBotToken)}/sendMessage`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      chat_id: config.telegramChatId,
+      text: formatBudgetThresholdAlert(input),
+      disable_web_page_preview: true,
+    }),
+  });
+  return true;
 }
 
 async function markApprovalStatus(
@@ -237,6 +326,25 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
       return;
     }
 
+    if (policy.scopeType === "adapter_type") {
+      await db
+        .update(agents)
+        .set({
+          status: "paused",
+          pauseReason: "budget",
+          pausedAt: now,
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(agents.companyId, policy.companyId),
+            eq(agents.adapterType, policy.scopeId),
+            inArray(agents.status, ["active", "idle", "running", "error"]),
+          ),
+        );
+      return;
+    }
+
     await db
       .update(companies)
       .set({
@@ -284,6 +392,25 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
       return;
     }
 
+    if (policy.scopeType === "adapter_type") {
+      await db
+        .update(agents)
+        .set({
+          status: "idle",
+          pauseReason: null,
+          pausedAt: null,
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(agents.companyId, policy.companyId),
+            eq(agents.adapterType, policy.scopeId),
+            eq(agents.pauseReason, "budget"),
+          ),
+        );
+      return;
+    }
+
     await db
       .update(companies)
       .set({
@@ -314,7 +441,7 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
   }
 
   async function buildPolicySummary(policy: PolicyRow): Promise<BudgetPolicySummary> {
-    const scope = await resolveScopeRecord(db, policy.scopeType as BudgetScopeType, policy.scopeId);
+    const scope = await resolveScopeRecord(db, policy.scopeType as BudgetScopeType, policy.scopeId, policy.companyId);
     const observedAmount = await computeObservedAmount(db, policy);
     const { start, end } = resolveWindow(policy.windowKind as BudgetWindowKind);
     const amount = policy.isActive ? policy.amount : 0;
@@ -366,7 +493,7 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
       .then((rows) => rows[0] ?? null);
     if (existing) return existing;
 
-    const scope = await resolveScopeRecord(db, policy.scopeType as BudgetScopeType, policy.scopeId);
+    const scope = await resolveScopeRecord(db, policy.scopeType as BudgetScopeType, policy.scopeId, policy.companyId);
     const payload = buildApprovalPayload({
       policy,
       scopeName: normalizeScopeName(policy.scopeType as BudgetScopeType, scope.name),
@@ -391,7 +518,7 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
         .then((rows) => rows[0] ?? null)
       : null;
 
-    return db
+    const incident = await db
       .insert(budgetIncidents)
       .values({
         companyId: policy.companyId,
@@ -410,6 +537,29 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
       })
       .returning()
       .then((rows) => rows[0] ?? null);
+
+    if (incident && thresholdType === "soft" && policy.notifyEnabled) {
+      try {
+        await sendBudgetThresholdTelegram({
+          policy,
+          scopeName: normalizeScopeName(policy.scopeType as BudgetScopeType, scope.name),
+          thresholdType,
+          amountObserved,
+          windowStart: start,
+          windowEnd: end,
+        });
+      } catch (err) {
+        logger.warn({
+          err,
+          companyId: policy.companyId,
+          policyId: policy.id,
+          scopeType: policy.scopeType,
+          scopeId: policy.scopeId,
+        }, "budget threshold Telegram alert failed");
+      }
+    }
+
+    return incident;
   }
 
   async function resolveOpenSoftIncidents(policyId: string) {
@@ -466,7 +616,7 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
 
     return Promise.all(
       rows.map(async (row) => {
-        const scope = await resolveScopeRecord(db, row.scopeType as BudgetScopeType, row.scopeId);
+        const scope = await resolveScopeRecord(db, row.scopeType as BudgetScopeType, row.scopeId, row.companyId);
         return {
           id: row.id,
           companyId: row.companyId,
@@ -508,7 +658,7 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
       input: BudgetPolicyUpsertInput,
       actorUserId: string | null,
     ): Promise<BudgetPolicySummary> => {
-      const scope = await resolveScopeRecord(db, input.scopeType, input.scopeId);
+      const scope = await resolveScopeRecord(db, input.scopeType, input.scopeId, companyId);
       if (scope.companyId !== companyId) {
         throw unprocessable("Budget scope does not belong to company");
       }
@@ -652,14 +802,24 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
           and(
             eq(budgetPolicies.companyId, event.companyId),
             eq(budgetPolicies.isActive, true),
-            inArray(budgetPolicies.scopeType, ["company", "agent", "project"]),
+            inArray(budgetPolicies.scopeType, ["company", "agent", "project", "adapter_type"]),
           ),
         );
+
+      const hasAdapterTypePolicy = candidatePolicies.some((policy) => policy.scopeType === "adapter_type");
+      const eventAgent = hasAdapterTypePolicy
+        ? await db
+          .select({ adapterType: agents.adapterType })
+          .from(agents)
+          .where(and(eq(agents.id, event.agentId), eq(agents.companyId, event.companyId)))
+          .then((rows) => rows[0] ?? null)
+        : null;
 
       const relevantPolicies = candidatePolicies.filter((policy) => {
         if (policy.scopeType === "company") return policy.scopeId === event.companyId;
         if (policy.scopeType === "agent") return policy.scopeId === event.agentId;
         if (policy.scopeType === "project") return Boolean(event.projectId) && policy.scopeId === event.projectId;
+        if (policy.scopeType === "adapter_type") return policy.scopeId === eventAgent?.adapterType;
         return false;
       });
 
@@ -724,6 +884,7 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
           pauseReason: agents.pauseReason,
           companyId: agents.companyId,
           name: agents.name,
+          adapterType: agents.adapterType,
         })
         .from(agents)
         .where(eq(agents.id, agentId))
@@ -773,6 +934,31 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
             scopeId: companyId,
             scopeName: company.name,
             reason: "Company cannot start new work because its budget hard-stop is exceeded.",
+          };
+        }
+      }
+
+      const adapterTypePolicy = await db
+        .select()
+        .from(budgetPolicies)
+        .where(
+          and(
+            eq(budgetPolicies.companyId, companyId),
+            eq(budgetPolicies.scopeType, "adapter_type"),
+            eq(budgetPolicies.scopeId, agent.adapterType),
+            eq(budgetPolicies.isActive, true),
+            eq(budgetPolicies.metric, "billed_cents"),
+          ),
+        )
+        .then((rows) => rows[0] ?? null);
+      if (adapterTypePolicy && adapterTypePolicy.hardStopEnabled && adapterTypePolicy.amount > 0) {
+        const observed = await computeObservedAmount(db, adapterTypePolicy);
+        if (observed >= adapterTypePolicy.amount) {
+          return {
+            scopeType: "adapter_type" as const,
+            scopeId: agent.adapterType,
+            scopeName: `Adapter type ${agent.adapterType}`,
+            reason: `Agent cannot start because the ${agent.adapterType} adapter monthly budget hard-stop is still exceeded.`,
           };
         }
       }

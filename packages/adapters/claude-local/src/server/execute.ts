@@ -548,6 +548,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       : `Claude exited with code ${proc.exitCode ?? -1}`;
   };
 
+  const buildFailureStderr = (proc: RunProcessResult, fallbackErrorMessage: string | null) => {
+    const parts: string[] = [];
+    const trimmedStderr = proc.stderr.trim();
+    const trimmedMessage = (fallbackErrorMessage ?? "").trim();
+    if (trimmedStderr) parts.push(trimmedStderr);
+    if (trimmedMessage && !trimmedStderr.includes(trimmedMessage)) parts.push(trimmedMessage);
+    return parts.length > 0 ? parts.join("\n") : proc.stderr;
+  };
+
   const runAttempt = async (resumeSessionId: string | null) => {
     const attemptInstructionsFilePath = resumeSessionId ? undefined : effectiveInstructionsFilePath;
     const args = buildClaudeArgs(resumeSessionId, attemptInstructionsFilePath);
@@ -628,6 +637,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     if (!parsed) {
       const fallbackErrorMessage = parseFallbackErrorMessage(proc);
+      const diagnosticStderr = buildFailureStderr(proc, fallbackErrorMessage);
       const transientUpstream =
         !loginMeta.requiresLogin &&
         (proc.exitCode ?? 0) !== 0 &&
@@ -661,7 +671,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         errorMeta,
         resultJson: {
           stdout: proc.stdout,
-          stderr: proc.stderr,
+          stderr: diagnosticStderr,
           ...(transientUpstream ? { errorFamily: "transient_upstream" } : {}),
           ...(transientRetryNotBefore
             ? { retryNotBefore: transientRetryNotBefore.toISOString() }
@@ -709,6 +719,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const errorMessage = failed
       ? describeClaudeFailure(parsed) ?? `Claude exited with code ${proc.exitCode ?? -1}`
       : null;
+    const diagnosticStderr = failed ? buildFailureStderr(proc, errorMessage) : proc.stderr;
     const transientUpstream =
       failed &&
       !loginMeta.requiresLogin &&
@@ -733,6 +744,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       : null;
     const mergedResultJson: Record<string, unknown> = {
       ...parsed,
+      ...(failed ? { stdout: proc.stdout, stderr: diagnosticStderr } : {}),
       ...(transientUpstream ? { errorFamily: "transient_upstream" } : {}),
       ...(transientRetryNotBefore ? { retryNotBefore: transientRetryNotBefore.toISOString() } : {}),
       ...(transientRetryNotBefore ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),

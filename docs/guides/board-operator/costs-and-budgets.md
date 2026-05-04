@@ -37,16 +37,73 @@ PATCH /api/agents/{agentId}
 { "budgetMonthlyCents": 5000 }
 ```
 
+This creates or updates the matching monthly `agent` budget policy. Existing
+`agents.budget_monthly_cents` values were backfilled into policies by migration
+`0032_pretty_doctor_octopus.sql`.
+
+### Per-Adapter Budget
+
+Set a monthly envelope for all agents using the same adapter type:
+
+```
+POST /api/companies/{companyId}/budgets/policies
+{
+  "scopeType": "adapter_type",
+  "scopeId": "codex_local",
+  "amount": 5000,
+  "windowKind": "calendar_month_utc"
+}
+```
+
+Use adapter type keys such as `codex_local`, `claude_local`, `cursor`, or
+`openclaw_gateway`. Adapter budgets are evaluated from `cost_events` joined to
+`agents.adapter_type`, so Codex spend is tracked separately from Claude spend.
+
 ## Budget Enforcement
 
 Paperclip enforces budgets automatically:
 
 | Threshold | Action |
 |-----------|--------|
-| 80% | Soft alert — agent is warned to focus on critical tasks only |
-| 100% | Hard stop — agent is auto-paused, no more heartbeats |
+| 80% | P1 Telegram soft alert |
+| 100% | Hard stop — affected scope is auto-paused, no more heartbeats |
 
 An auto-paused agent can be resumed by increasing its budget or waiting for the next calendar month.
+
+## Resetting a Monthly Budget Hold
+
+Rasmus can reset a budget hold by raising the budget from the UI/API, resolving
+the open incident, or by manually clearing the budget-owned pause after verifying
+that the current-month spend is below the new limit.
+
+Manual SQL for an agent:
+
+```sql
+update agents
+set status = 'idle',
+    pause_reason = null,
+    paused_at = null,
+    updated_at = now()
+where id = '<agent-id>'
+  and pause_reason = 'budget';
+```
+
+Manual SQL for an adapter type:
+
+```sql
+update agents
+set status = 'idle',
+    pause_reason = null,
+    paused_at = null,
+    updated_at = now()
+where company_id = '<company-id>'
+  and adapter_type = '<adapter-type>'
+  and pause_reason = 'budget';
+```
+
+If spend is still at or above the active policy amount, the next heartbeat or
+cost event will recreate the hard stop. Raise the policy amount first when the
+intent is to resume immediately.
 
 ## Viewing Costs
 

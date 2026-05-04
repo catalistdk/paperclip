@@ -52,6 +52,194 @@ const ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE = 500;
 export const MAX_CHILD_ISSUES_CREATED_BY_HELPER = 25;
 const MAX_CHILD_COMPLETION_SUMMARIES = 20;
 const CHILD_COMPLETION_SUMMARY_BODY_MAX_CHARS = 500;
+const PRD_APPROVAL_COMMENT_RE = /^(approved?[ \t]*(\n|$)|approved?:.*|##[^\n]*approv)/i;
+const PRD_REFERENCE_RE = /\b(?:prd|prd_ref|prd-reference|approved_prd)\s*[:=#-]\s*([A-Z][A-Z0-9]+-\d+)\b/gi;
+const PRD_EXEMPTION_RE = /\b(?:prd_exempt|prd-exempt|prd_exemption_reason|prd-exemption-reason)\s*[:=-]\s*(\S.{4,})/i;
+const EXPLICIT_PLATFORM_CHANGE_RE = /\bplatform[_ -]?change\s*[:=-]\s*(true|yes|required)\b/i;
+const PLATFORM_CHANGE_MARKERS = [
+  /\bpaperclip\b/i,
+  /\bcontrol[- ]plane\b/i,
+  /\bplatform governance\b/i,
+  /\bgovernance gate\b/i,
+  /\bapproval gate\b/i,
+  /\bprd gate\b/i,
+  /\bissue checkout\b/i,
+  /\bissue creation\b/i,
+  /\bheartbeat scheduler\b/i,
+  /\bagent runtime\b/i,
+  /\bexecution workspace\b/i,
+  /\bplugin host\b/i,
+];
+const OPERATIONAL_OR_REVIEW_MARKERS = [
+  /\bscraper\b/i,
+  /\bscraper qa\b/i,
+  /\bqa\b/i,
+  /\bbug\b/i,
+  /\bfix\b/i,
+  /\brecovery\b/i,
+  /\bemergency\b/i,
+  /\bincident\b/i,
+  /\boauth\b/i,
+  /\bci\b/i,
+  /\btest failure\b/i,
+  /\breview\b/i,
+  /\baudit\b/i,
+  /\bdocs?\b/i,
+  /\bstandup\b/i,
+];
+const OPERATIONAL_OR_REVIEW_ORIGIN_KINDS = new Set([
+  "routine_execution",
+  "harness_liveness_escalation",
+  "stale_active_run_evaluation",
+]);
+
+export type PlatformPrdGateEvaluation = {
+  qualifies: boolean;
+  allowed: boolean;
+  reason: string;
+  prdIdentifier?: string;
+  exemptionReason?: string;
+};
+
+function issueTextForPrdGate(input: {
+  title?: string | null;
+  description?: string | null;
+}) {
+  return `${input.title ?? ""}\n${input.description ?? ""}`;
+}
+
+function extractPrdExemptionReason(text: string) {
+  return text.match(PRD_EXEMPTION_RE)?.[1]?.trim() ?? null;
+}
+
+function extractPrdReferenceIdentifiers(text: string) {
+  const identifiers = new Set<string>();
+  for (const match of text.matchAll(PRD_REFERENCE_RE)) {
+    if (match[1]) identifiers.add(match[1].toUpperCase());
+  }
+  return [...identifiers];
+}
+
+export function isPlatformPrdGateCandidate(input: {
+  title?: string | null;
+  description?: string | null;
+  originKind?: string | null;
+}) {
+  const text = issueTextForPrdGate(input);
+  if (EXPLICIT_PLATFORM_CHANGE_RE.test(text)) return true;
+  if (input.originKind && OPERATIONAL_OR_REVIEW_ORIGIN_KINDS.has(input.originKind)) return false;
+  if (OPERATIONAL_OR_REVIEW_MARKERS.some((marker) => marker.test(text))) return false;
+  return PLATFORM_CHANGE_MARKERS.some((marker) => marker.test(text));
+}
+
+function hasApprovedExecutionState(issue: { executionState?: unknown }) {
+  const executionState = issue.executionState;
+  if (!executionState || typeof executionState !== "object") return false;
+  return (executionState as Record<string, unknown>).lastDecisionOutcome === "approved";
+}
+
+async function hasBoardApprovalComment(
+  dbOrTx: Pick<Db, "select">,
+  issueId: string,
+) {
+  if (!isUuidLike(issueId)) return false;
+  const rows = await dbOrTx
+    .select({
+      authorAgentId: issueComments.authorAgentId,
+      authorUserId: issueComments.authorUserId,
+      body: issueComments.body,
+      createdAt: issueComments.createdAt,
+    })
+    .from(issueComments)
+    .where(eq(issueComments.issueId, issueId))
+    .orderBy(desc(issueComments.createdAt));
+  return rows.some((row) => row.authorUserId && !row.authorAgentId && PRD_APPROVAL_COMMENT_RE.test(row.body));
+}
+
+async function issueHasPlanDocument(dbOrTx: Pick<Db, "select">, issueId: string) {
+  if (!isUuidLike(issueId)) return false;
+  const row = await dbOrTx
+    .select({ id: issueDocuments.id })
+    .from(issueDocuments)
+    .where(and(eq(issueDocuments.issueId, issueId), eq(issueDocuments.key, "plan")))
+    .then((rows) => rows[0] ?? null);
+  return Boolean(row);
+}
+
+async function findApprovedReferencedPrd(
+  dbOrTx: Pick<Db, "select">,
+  companyId: string,
+  identifiers: string[],
+) {
+  for (const identifier of identifiers) {
+    const prdIssue = await dbOrTx
+      .select({
+        id: issues.id,
+        executionState: issues.executionState,
+      })
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.identifier, identifier)))
+      .then((rows) => rows[0] ?? null);
+    if (!prdIssue) continue;
+    if (hasApprovedExecutionState(prdIssue) || await hasBoardApprovalComment(dbOrTx, prdIssue.id)) {
+      return identifier;
+    }
+  }
+  return null;
+}
+
+async function evaluatePlatformPrdGate(
+  dbOrTx: Pick<Db, "select">,
+  issue: Pick<typeof issues.$inferSelect, "id" | "companyId" | "title" | "description" | "originKind" | "executionState">,
+): Promise<PlatformPrdGateEvaluation> {
+  const text = issueTextForPrdGate(issue);
+  if (!isPlatformPrdGateCandidate(issue)) {
+    return { qualifies: false, allowed: true, reason: "Issue is outside the platform-change PRD gate scope" };
+  }
+
+  const exemptionReason = extractPrdExemptionReason(text);
+  if (exemptionReason) {
+    return { qualifies: true, allowed: true, reason: "Explicit PRD exemption reason recorded", exemptionReason };
+  }
+
+  const referencedPrd = await findApprovedReferencedPrd(
+    dbOrTx,
+    issue.companyId,
+    extractPrdReferenceIdentifiers(text),
+  );
+  if (referencedPrd) {
+    return { qualifies: true, allowed: true, reason: "Approved PRD reference found", prdIdentifier: referencedPrd };
+  }
+
+  if (await issueHasPlanDocument(dbOrTx, issue.id)) {
+    if (hasApprovedExecutionState(issue) || await hasBoardApprovalComment(dbOrTx, issue.id)) {
+      return { qualifies: true, allowed: true, reason: "Issue plan document is approved" };
+    }
+  }
+
+  return {
+    qualifies: true,
+    allowed: false,
+    reason:
+      "Platform-change execution requires an approved PRD/plan reference or an explicit exemption reason. Add `prd: VER-123` referencing an approved PRD, approve this issue's `plan` document, or add `prd_exempt: <reason>` for emergency ops, bug recovery, scraper QA, or pure review work.",
+  };
+}
+
+async function assertPlatformPrdGateAllowsExecution(
+  dbOrTx: Pick<Db, "select">,
+  issue: Pick<typeof issues.$inferSelect, "id" | "companyId" | "identifier" | "title" | "description" | "originKind" | "executionState">,
+) {
+  const gate = await evaluatePlatformPrdGate(dbOrTx, issue);
+  if (!gate.allowed) {
+    throw unprocessable(gate.reason, {
+      issueId: issue.id,
+      identifier: issue.identifier,
+      gate: "verner-prd-platform-change",
+    });
+  }
+  return gate;
+}
+
 function assertTransition(from: string, to: string) {
   if (from === to) return;
   if (!ALL_ISSUE_STATUSES.includes(to)) {
@@ -2445,6 +2633,17 @@ export function issueService(db: Db) {
           issueNumber,
           identifier,
         } as typeof issues.$inferInsert;
+        if (values.status === "in_progress") {
+          await assertPlatformPrdGateAllowsExecution(tx, {
+            id: values.id ?? "",
+            companyId,
+            identifier,
+            title: values.title,
+            description: values.description ?? null,
+            originKind: values.originKind ?? "manual",
+            executionState: values.executionState ?? null,
+          });
+        }
         if (values.status === "in_progress" && !values.startedAt) {
           values.startedAt = new Date();
         }
@@ -2536,6 +2735,13 @@ export function issueService(db: Db) {
         if (unresolvedBlockerIssueIds.length > 0) {
           throw unprocessable("Issue is blocked by unresolved blockers", { unresolvedBlockerIssueIds });
         }
+        await assertPlatformPrdGateAllowsExecution(dbOrTx, {
+          ...existing,
+          title: patch.title ?? existing.title,
+          description: patch.description !== undefined ? patch.description : existing.description,
+          originKind: patch.originKind ?? existing.originKind,
+          executionState: patch.executionState !== undefined ? patch.executionState : existing.executionState,
+        });
       }
       if (issueData.assigneeAgentId) {
         await assertAssignableAgent(existing.companyId, issueData.assigneeAgentId);
@@ -2723,6 +2929,22 @@ export function issueService(db: Db) {
       if (unresolvedBlockerIssueIds.length > 0) {
         throw unprocessable("Issue is blocked by unresolved blockers", { unresolvedBlockerIssueIds });
       }
+
+      const gateIssue = await db
+        .select({
+          id: issues.id,
+          companyId: issues.companyId,
+          identifier: issues.identifier,
+          title: issues.title,
+          description: issues.description,
+          originKind: issues.originKind,
+          executionState: issues.executionState,
+        })
+        .from(issues)
+        .where(eq(issues.id, id))
+        .then((rows) => rows[0] ?? null);
+      if (!gateIssue) throw notFound("Issue not found");
+      await assertPlatformPrdGateAllowsExecution(db, gateIssue);
 
       const sameRunAssigneeCondition = checkoutRunId
         ? and(

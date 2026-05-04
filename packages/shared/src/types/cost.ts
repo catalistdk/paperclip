@@ -10,6 +10,7 @@ export interface CostEvent {
   heartbeatRunId: string | null;
   billingCode: string | null;
   provider: string;
+  adapterType: string;
   biller: string;
   billingType: BillingType;
   model: string;
@@ -72,6 +73,17 @@ export interface CostByBiller {
   subscriptionOutputTokens: number;
   providerCount: number;
   modelCount: number;
+}
+
+export interface CostByAdapter {
+  adapterType: string;
+  costCents: number;
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  apiRunCount: number;
+  subscriptionRunCount: number;
+  agentCount: number;
 }
 
 /** per-agent breakdown by provider + model, for identifying token-hungry agents */

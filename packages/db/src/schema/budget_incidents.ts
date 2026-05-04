@@ -11,7 +11,7 @@ export const budgetIncidents = pgTable(
     companyId: uuid("company_id").notNull().references(() => companies.id),
     policyId: uuid("policy_id").notNull().references(() => budgetPolicies.id),
     scopeType: text("scope_type").notNull(),
-    scopeId: uuid("scope_id").notNull(),
+    scopeId: text("scope_id").notNull(),
     metric: text("metric").notNull(),
     windowKind: text("window_kind").notNull(),
     windowStart: timestamp("window_start", { withTimezone: true }).notNull(),

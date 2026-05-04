@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const ASSIGNEE_AGENT_ID = "11111111-1111-4111-8111-111111111111";
 
 const mockIssueService = vi.hoisted(() => ({
+  assertCheckoutOwner: vi.fn(),
   getById: vi.fn(),
   update: vi.fn(),
   addComment: vi.fn(),
@@ -21,6 +22,13 @@ const mockHeartbeatService = vi.hoisted(() => ({
   getActiveRunForAgent: vi.fn(async () => null),
   cancelRun: vi.fn(async () => null),
 }));
+const mockAgentService = vi.hoisted(() => ({
+  getById: vi.fn(),
+  resolveByReference: vi.fn(async (_companyId: string, raw: string) => ({
+    ambiguous: false,
+    agent: { id: raw },
+  })),
+}));
 const mockIssueThreadInteractionService = vi.hoisted(() => ({
   expireRequestConfirmationsSupersededByComment: vi.fn(async () => []),
   expireStaleRequestConfirmationsForIssueDocument: vi.fn(async () => []),
@@ -31,13 +39,7 @@ vi.mock("../services/index.js", () => ({
     canUser: vi.fn(async () => true),
     hasPermission: vi.fn(async () => true),
   }),
-  agentService: () => ({
-    getById: vi.fn(async () => null),
-    resolveByReference: vi.fn(async (_companyId: string, raw: string) => ({
-      ambiguous: false,
-      agent: { id: raw },
-    })),
-  }),
+  agentService: () => mockAgentService,
   documentService: () => ({}),
   executionWorkspaceService: () => ({}),
   feedbackService: () => ({
@@ -86,13 +88,7 @@ function registerModuleMocks() {
       canUser: vi.fn(async () => true),
       hasPermission: vi.fn(async () => true),
     }),
-    agentService: () => ({
-      getById: vi.fn(async () => null),
-      resolveByReference: vi.fn(async (_companyId: string, raw: string) => ({
-        ambiguous: false,
-        agent: { id: raw },
-      })),
-    }),
+    agentService: () => mockAgentService,
     documentService: () => ({}),
     executionWorkspaceService: () => ({}),
     feedbackService: () => ({
@@ -136,7 +132,13 @@ function registerModuleMocks() {
   }));
 }
 
-async function createApp() {
+async function createApp(actor: Record<string, unknown> = {
+  type: "board",
+  userId: "local-board",
+  companyIds: ["company-1"],
+  source: "local_implicit",
+  isInstanceAdmin: false,
+}) {
   const [{ errorHandler }, { issueRoutes }] = await Promise.all([
     vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
     vi.importActual<typeof import("../routes/issues.js")>("../routes/issues.js"),
@@ -144,13 +146,7 @@ async function createApp() {
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
-    (req as any).actor = {
-      type: "board",
-      userId: "local-board",
-      companyIds: ["company-1"],
-      source: "local_implicit",
-      isInstanceAdmin: false,
-    };
+    (req as any).actor = actor;
     next();
   });
   app.use("/api", issueRoutes({} as any, {} as any));
@@ -191,6 +187,8 @@ describe("issue update comment wakeups", () => {
     mockIssueService.getRelationSummaries.mockResolvedValue({ blockedBy: [], blocks: [] });
     mockIssueService.listWakeableBlockedDependents.mockResolvedValue([]);
     mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue(null);
+    mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
+    mockAgentService.getById.mockResolvedValue(null);
   });
 
   it("includes the new comment in assignment wakes from issue updates", async () => {
@@ -281,6 +279,115 @@ describe("issue update comment wakeups", () => {
           wakeReason: "issue_commented",
           source: "issue.comment",
         }),
+      }),
+    );
+  });
+
+  it("rejects Scraper QA PASS close comments without qa_three_layer.py evidence", async () => {
+    const existing = makeIssue({
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+      status: "in_progress",
+    });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockAgentService.getById.mockResolvedValue({
+      id: ASSIGNEE_AGENT_ID,
+      companyId: existing.companyId,
+      name: "Scraper QA",
+      role: "Scraper QA",
+    });
+
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: ASSIGNEE_AGENT_ID,
+      companyId: existing.companyId,
+      source: "agent_key",
+      runId: "22222222-2222-4222-8222-222222222222",
+    }))
+      .patch(`/api/issues/${existing.id}`)
+      .send({
+        status: "done",
+        comment: "QA PASSED — all checks looked good.",
+      });
+
+    expect(res.status).toBe(422);
+    expect(res.body.error).toContain("qa_three_layer.py evidence");
+    expect(res.body.missingEvidence).toEqual(expect.arrayContaining([
+      "`qa_three_layer.py` command/output marker",
+      "`THREE-LAYER QA REPORT` header",
+      "Layer 1 PASS line",
+      "Layer 2 PASS line",
+      "Layer 3 PASS line",
+      "`Overall: PASSED` line",
+    ]));
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
+  });
+
+  it("allows Scraper QA PASS close comments with qa_three_layer.py evidence", async () => {
+    const existing = makeIssue({
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+      status: "in_progress",
+    });
+    const updated = { ...existing, status: "done" };
+    const comment = [
+      "QA PASSED — all 3 stages.",
+      "",
+      "Command: `python scraper/qa_three_layer.py --csv competitor_products.csv --collection-id 33333333-3333-4333-8333-333333333333`",
+      "[qa_three_layer] CSV: competitor_products.csv (6 rows)",
+      "[qa_three_layer] Collection: 33333333-3333-4333-8333-333333333333",
+      "",
+      "============================================================",
+      "  THREE-LAYER QA REPORT",
+      "  Collection: 33333333-3333-4333-8333-333333333333",
+      "============================================================",
+      "",
+      "  Layer 1 (Scraper CSV):   [PASS]",
+      "  Layer 2 (DB parity):     [PASS]",
+      "  Layer 3 (WebUI render):  [PASS]",
+      "",
+      "  Overall: PASSED",
+    ].join("\n");
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue(updated);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-pass",
+      issueId: existing.id,
+      companyId: existing.companyId,
+      body: comment,
+    });
+    mockAgentService.getById.mockResolvedValue({
+      id: ASSIGNEE_AGENT_ID,
+      companyId: existing.companyId,
+      name: "Scraper QA",
+      role: "Scraper QA",
+    });
+
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: ASSIGNEE_AGENT_ID,
+      companyId: existing.companyId,
+      source: "agent_key",
+      runId: "22222222-2222-4222-8222-222222222222",
+    }))
+      .patch(`/api/issues/${existing.id}`)
+      .send({
+        status: "done",
+        comment,
+      });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      existing.id,
+      expect.objectContaining({ status: "done", actorAgentId: ASSIGNEE_AGENT_ID }),
+    );
+    expect(mockIssueService.addComment).toHaveBeenCalledWith(
+      existing.id,
+      comment,
+      expect.objectContaining({
+        agentId: ASSIGNEE_AGENT_ID,
+        runId: "22222222-2222-4222-8222-222222222222",
       }),
     );
   });

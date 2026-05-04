@@ -125,6 +125,33 @@ function didAutomaticRecoveryFail(
     );
 }
 
+// Detects the OAuth-401 "adapter_failed: Invalid authentication credentials"
+// pattern observed during token expiry (see VER-401). When the latest retry
+// failed for adapter-auth reasons, creating a recovery issue would just re-fail
+// for the same reason, so we suppress recovery creation and surface the auth
+// failure instead.
+function isLikelyAdapterAuthFailure(latestRun: LatestIssueRun): boolean {
+  if (!latestRun) return false;
+  const errorCode = readNonEmptyString(latestRun.errorCode)?.toLowerCase().trim() ?? "";
+  const error = readNonEmptyString(latestRun.error)?.toLowerCase() ?? "";
+  if (errorCode !== "adapter_failed") return false;
+  return /invalid authentication credentials|api error:\s*401|\b401\b/.test(error);
+}
+
+type RecoverySuppressionReason = "chain_cap" | "adapter_auth_failure";
+
+// Caps the recovery chain depth at 1 and short-circuits known-doomed adapter
+// auth failures. Returns the reason recovery should be skipped, or null when
+// recovery creation should proceed normally.
+function computeRecoverySuppressionReason(
+  issue: typeof issues.$inferSelect,
+  latestRun: LatestIssueRun,
+): RecoverySuppressionReason | null {
+  if (issue.originKind === STRANDED_ISSUE_RECOVERY_ORIGIN_KIND) return "chain_cap";
+  if (isLikelyAdapterAuthFailure(latestRun)) return "adapter_auth_failure";
+  return null;
+}
+
 function issueIdFromRunContext(contextSnapshot: unknown) {
   const context = parseObject(contextSnapshot);
   return readNonEmptyString(context.issueId) ?? readNonEmptyString(context.taskId);
@@ -1248,6 +1275,15 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     latestRun: LatestIssueRun;
     previousStatus: "todo" | "in_progress";
   }) {
+    // Recovery-chain depth cap (max 1). If the source issue is itself a
+    // stranded-issue-recovery task, do not create a recovery-of-a-recovery —
+    // that produced the 41-issue cascade observed during the 2026-04-27 OAuth
+    // expiry (VER-400). The original issue stays blocked with a comment that
+    // names the recursion cap.
+    if (input.issue.originKind === STRANDED_ISSUE_RECOVERY_ORIGIN_KIND) {
+      return null;
+    }
+
     const existing = await findOpenStrandedIssueRecoveryIssue(input.issue.companyId, input.issue.id);
     if (existing) return existing;
 
@@ -1348,11 +1384,16 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     latestRun: LatestIssueRun;
     comment: string;
   }) {
-    const recoveryIssue = await ensureStrandedIssueRecoveryIssue({
-      issue: input.issue,
-      previousStatus: input.previousStatus,
-      latestRun: input.latestRun,
-    });
+    const suppressionReason = computeRecoverySuppressionReason(input.issue, input.latestRun);
+    const recoveryIssue = suppressionReason
+      ? null
+      : await ensureStrandedIssueRecoveryIssue({
+        issue: input.issue,
+        previousStatus: input.previousStatus,
+        latestRun: input.latestRun,
+      });
+    const recoveryChainCapped = suppressionReason === "chain_cap";
+    const recoveryAuthFailureSuppressed = suppressionReason === "adapter_auth_failure";
     const blockerIds = await existingUnresolvedBlockerIssueIds(input.issue.companyId, input.issue.id);
     const nextBlockerIds = recoveryIssue
       ? [...new Set([...blockerIds, recoveryIssue.id])]
@@ -1369,6 +1410,18 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         "",
         `- Recovery issue: ${issueUiLink({ identifier: recoveryIssue.identifier, id: recoveryIssue.id }, prefix)}`,
         "- Next action: the recovery owner should either restore a live execution path or record the manual resolution, then mark the recovery issue done.",
+      ].join("\n")
+      : recoveryChainCapped
+      ? [
+        "",
+        "- Recovery issue: none created — this issue is itself a stranded-issue recovery task, and Paperclip caps the recovery chain depth at 1 to avoid recursive ghost-recovery cascades.",
+        "- Next action: a board operator should resolve the underlying runtime/auth failure (recovery-of-recovery is intentionally not created), then mark this recovery issue done or cancelled.",
+      ].join("\n")
+      : recoveryAuthFailureSuppressed
+      ? [
+        "",
+        "- Recovery issue: none created — latest retry failed with `adapter_failed: Invalid authentication credentials`. Creating a recovery would re-fail for the same reason.",
+        "- Next action: restore adapter authentication (refresh OAuth token or restart the server). Paperclip will retry this issue once auth is healthy.",
       ].join("\n")
       : [
         "",
@@ -1396,6 +1449,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         latestRunStatus: input.latestRun?.status ?? null,
         latestRunErrorCode: input.latestRun?.errorCode ?? null,
         recoveryIssueId: recoveryIssue?.id ?? null,
+        recoveryChainCapped,
+        recoveryAuthFailureSuppressed,
+        recoverySuppressionReason: suppressionReason,
         blockerIssueIds: nextBlockerIds,
       },
     });

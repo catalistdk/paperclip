@@ -111,6 +111,7 @@ import {
 import { isAutomaticRecoverySuppressedByPauseHold } from "./recovery/pause-hold-guard.js";
 import { recoveryService } from "./recovery/service.js";
 import { withAgentStartLock } from "./agent-start-lock.js";
+import { enforceAgentErrorStateHoldTtl } from "./agent-error-state-holds.js";
 import { redactCurrentUserText, redactCurrentUserValue } from "../log-redaction.js";
 import {
   hasSessionCompactionThresholds,
@@ -3778,6 +3779,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       await cancelRunInternal(run.id, "Cancelled because the agent is not invokable");
       return null;
     }
+    const errorStateHold = await enforceAgentErrorStateHoldTtl(db, agent);
+    if (errorStateHold.state === "active") {
+      logger.info(
+        {
+          agentId: agent.id,
+          runId: run.id,
+          expiresAt: errorStateHold.expiresAt.toISOString(),
+          capped: errorStateHold.capped,
+        },
+        "claimQueuedRun: agent error-state hold is active",
+      );
+      return null;
+    }
 
     const context = parseObject(run.contextSnapshot);
     const budgetBlock = await getInvocationBlock(run.companyId, run.agentId, {
@@ -4448,6 +4462,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const agent = await getAgent(agentId);
       if (!agent) return [];
       if (agent.status === "paused" || agent.status === "terminated" || agent.status === "pending_approval") {
+        return [];
+      }
+      const errorStateHold = await enforceAgentErrorStateHoldTtl(db, agent);
+      if (errorStateHold.state === "active") {
+        logger.info(
+          {
+            agentId,
+            expiresAt: errorStateHold.expiresAt.toISOString(),
+            capped: errorStateHold.capped,
+          },
+          "startNextQueuedRunForAgent: agent error-state hold is active",
+        );
         return [];
       }
       const policy = parseHeartbeatPolicy(agent);
@@ -6301,6 +6327,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       throw conflict("Agent is not invokable in its current state", { status: agent.status });
     }
 
+    const errorStateHold = await enforceAgentErrorStateHoldTtl(db, agent);
+    if (errorStateHold.state === "active") {
+      await writeSkippedRequest("agent_error_state_hold_active");
+      return null;
+    }
+
     const policy = parseHeartbeatPolicy(agent);
 
     if (source === "timer" && !policy.enabled) {
@@ -6983,6 +7015,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ),
         )
         .then((rows) => rows.map((row) => row.id));
+    } else if (scope.scopeType === "adapter_type") {
+      const adapterAgentIds = await db
+        .select({ id: agents.id })
+        .from(agents)
+        .where(and(eq(agents.companyId, scope.companyId), eq(agents.adapterType, scope.scopeId)))
+        .then((rows) => rows.map((row) => row.id));
+
+      wakeupIds = adapterAgentIds.length > 0
+        ? await db
+          .select({ id: agentWakeupRequests.id })
+          .from(agentWakeupRequests)
+          .where(
+            and(
+              eq(agentWakeupRequests.companyId, scope.companyId),
+              inArray(agentWakeupRequests.agentId, adapterAgentIds),
+              inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"]),
+              sql`${agentWakeupRequests.runId} is null`,
+            ),
+          )
+          .then((rows) => rows.map((row) => row.id))
+        : [];
     } else {
       wakeupIds = await listProjectScopedWakeupIds(scope.companyId, scope.scopeId);
     }
@@ -7109,19 +7162,41 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return;
     }
 
-    const runIds =
-      scope.scopeType === "company"
+    let runIds: string[];
+    if (scope.scopeType === "company") {
+      runIds = await db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, scope.companyId),
+            inArray(heartbeatRuns.status, [...CANCELLABLE_HEARTBEAT_RUN_STATUSES]),
+          ),
+        )
+        .then((rows) => rows.map((row) => row.id));
+    } else if (scope.scopeType === "adapter_type") {
+      const adapterAgentIds = await db
+        .select({ id: agents.id })
+        .from(agents)
+        .where(and(eq(agents.companyId, scope.companyId), eq(agents.adapterType, scope.scopeId)))
+        .then((rows) => rows.map((row) => row.id));
+
+      runIds = adapterAgentIds.length > 0
         ? await db
           .select({ id: heartbeatRuns.id })
           .from(heartbeatRuns)
           .where(
             and(
               eq(heartbeatRuns.companyId, scope.companyId),
+              inArray(heartbeatRuns.agentId, adapterAgentIds),
               inArray(heartbeatRuns.status, [...CANCELLABLE_HEARTBEAT_RUN_STATUSES]),
             ),
           )
           .then((rows) => rows.map((row) => row.id))
-        : await listProjectScopedRunIds(scope.companyId, scope.scopeId);
+        : [];
+    } else {
+      runIds = await listProjectScopedRunIds(scope.companyId, scope.scopeId);
+    }
 
     for (const runId of runIds) {
       await cancelRunInternal(runId, "Cancelled due to budget pause");

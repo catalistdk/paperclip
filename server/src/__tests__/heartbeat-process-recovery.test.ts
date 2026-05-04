@@ -1126,6 +1126,52 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(comments[0]?.body).toContain(`Recovery issue: [${recovery.identifier}]`);
   });
 
+  it("does not create a recovery-of-recovery when the stranded issue is itself a stranded_issue_recovery (chain depth cap)", async () => {
+    // Regression for VER-400 (TICK-422 OAuth-expiry cascade): terminal-run-recovery
+    // recursed when each new recovery issue also failed auth, producing 41
+    // ghost issues. Chain depth must be capped at 1.
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "todo",
+      runStatus: "failed",
+      retryReason: "assignment_recovery",
+    });
+    // Promote the seeded issue into a recovery issue (originKind set, originId
+    // pointing at a hypothetical earlier source).
+    await db
+      .update(issues)
+      .set({ originKind: "stranded_issue_recovery", originId: randomUUID() })
+      .where(eq(issues.id, issueId));
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.escalated).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+
+    // The original recovery issue is blocked, but no recovery-of-recovery exists.
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("blocked");
+
+    const recoveryChildren = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stranded_issue_recovery"), eq(issues.originId, issueId)));
+    expect(recoveryChildren).toHaveLength(0);
+
+    // No new wakeup was enqueued for the agent on the back of a fresh recovery issue.
+    const wakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    // Only the seed wakeup pre-existed.
+    expect(wakeups).toHaveLength(1);
+
+    // The block comment names the recursion cap, not "no invokable owner".
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.body).toContain("recovery chain depth at 1");
+    expect(comments[0]?.body).not.toContain("invokable manager, creator, or executive owner");
+  });
+
   it("assigns open unassigned blockers back to their creator agent", async () => {
     const companyId = randomUUID();
     const creatorAgentId = randomUUID();
@@ -1439,6 +1485,110 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(comments[0]?.body).toContain("retried continuation");
     expect(comments[0]?.body).toContain("Latest retry failure: `process_lost` - run failed before issue advanced.");
     expect(comments[0]?.body).toContain(`Recovery issue: [${recovery.identifier}]`);
+  });
+
+  it("caps the recovery chain at depth 1 and does not create a child recovery for an already-stranded recovery issue (VER-401)", async () => {
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "issue_continuation_needed",
+    });
+    // Mark the seeded issue as itself being a stranded-issue recovery task.
+    // This simulates the failure path where Paperclip created a recovery issue,
+    // its agent run later stranded, and reconcile re-enters escalation for it.
+    await db
+      .update(issues)
+      .set({
+        originKind: "stranded_issue_recovery",
+        originId: randomUUID(),
+        originRunId: runId,
+      })
+      .where(eq(issues.id, issueId));
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.escalated).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const sourceIssue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(sourceIssue?.status).toBe("blocked");
+
+    // Critical: NO recovery issue is created for this already-recovery source.
+    // Without the chain cap this would spawn "Recover stalled issue X" → cascade.
+    const childRecoveries = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, "stranded_issue_recovery"),
+          eq(issues.originId, issueId),
+        ),
+      );
+    expect(childRecoveries).toHaveLength(0);
+
+    const blockerRelations = await db
+      .select()
+      .from(issueRelations)
+      .where(
+        and(
+          eq(issueRelations.companyId, companyId),
+          eq(issueRelations.relatedIssueId, issueId),
+          eq(issueRelations.type, "blocks"),
+        ),
+      );
+    expect(blockerRelations).toHaveLength(0);
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.body).toContain("caps the recovery chain depth at 1");
+
+    const wakeups = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
+    // Only the seed wakeup; no new recovery wakeup was emitted.
+    expect(wakeups).toHaveLength(1);
+  });
+
+  it("does not create a recovery when the latest retry failed with adapter_failed: Invalid authentication credentials (VER-401)", async () => {
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "issue_continuation_needed",
+    });
+    // Rewrite the latest retry to look like a Claude OAuth-401 adapter failure.
+    await db
+      .update(heartbeatRuns)
+      .set({
+        errorCode: "adapter_failed",
+        error: "adapter_failed - Invalid authentication credentials (API Error: 401)",
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.escalated).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const sourceIssue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(sourceIssue?.status).toBe("blocked");
+
+    const recoveries = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, "stranded_issue_recovery"),
+          eq(issues.originId, issueId),
+        ),
+      );
+    expect(recoveries).toHaveLength(0);
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.body).toContain("Invalid authentication credentials");
+
+    const wakeups = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakeups).toHaveLength(1);
   });
 
   it("does not escalate paused-tree recovery when the automatic continuation retry was cancelled by the hold", async () => {

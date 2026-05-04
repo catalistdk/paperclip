@@ -7,11 +7,13 @@ import {
   agents,
   companies,
   createDb,
+  documents,
   executionWorkspaces,
   goals,
   heartbeatRuns,
   instanceSettings,
   issueComments,
+  issueDocuments,
   issueInboxArchives,
   issueRelations,
   issues,
@@ -2158,4 +2160,133 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
       .then((rows) => rows[0]);
     expect(row).toEqual({ executionRunId: null, executionLockedAt: null });
   });
+});
+
+describeEmbeddedPostgres("issueService Verner PRD platform-change gate", () => {
+  let db!: ReturnType<typeof createDb>;
+  let svc!: ReturnType<typeof issueService>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-prd-gate-");
+    db = createDb(tempDb.connectionString);
+    svc = issueService(db);
+    await ensureIssueRelationsTable(db);
+  }, 60_000);
+
+  afterEach(async () => {
+    await db.delete(issueDocuments);
+    await db.delete(documents);
+    await db.delete(issueComments);
+    await db.delete(issueRelations);
+    await db.delete(issueInboxArchives);
+    await db.delete(activityLog);
+    await db.delete(issues);
+    await db.delete(executionWorkspaces);
+    await db.delete(projectWorkspaces);
+    await db.delete(projects);
+    await db.delete(goals);
+    await db.delete(heartbeatRuns);
+    await db.delete(agents);
+    await db.delete(instanceSettings);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  async function seedCompanyAndAgent() {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Verner",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CTO Codex",
+      role: "CTO",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    return { companyId, agentId };
+  }
+
+  it("allows checkout of a platform change that references an approved PRD", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const prd = await svc.create(companyId, {
+      title: "PRD: Platform gate",
+      description: "Plan lives in the plan document.",
+      status: "todo",
+      priority: "high",
+    });
+    await db
+      .update(issues)
+      .set({ executionState: { lastDecisionOutcome: "approved" } })
+      .where(eq(issues.id, prd.id));
+    const issue = await svc.create(companyId, {
+      title: "Enforce Paperclip approval gate",
+      description: `platform_change: true\nprd: ${prd.identifier}`,
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+    });
+
+    const checkedOut = await svc.checkout(issue.id, agentId, ["todo"], null);
+
+    expect(checkedOut.status).toBe("in_progress");
+  }, 20_000);
+
+  it("allows checkout of a platform change with an explicit exemption reason", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issue = await svc.create(companyId, {
+      title: "Patch Paperclip scheduler outage",
+      description: "platform_change: true\nprd_exempt: emergency recovery for production scheduler outage",
+      status: "todo",
+      priority: "critical",
+      assigneeAgentId: agentId,
+    });
+
+    const checkedOut = await svc.checkout(issue.id, agentId, ["todo"], null);
+
+    expect(checkedOut.status).toBe("in_progress");
+  }, 20_000);
+
+  it("rejects unlinked non-exempt platform changes before execution begins", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issue = await svc.create(companyId, {
+      title: "Enforce Paperclip approval gate",
+      description: "platform_change: true\nNo PRD reference or exemption is recorded.",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+    });
+
+    await expect(svc.checkout(issue.id, agentId, ["todo"], null)).rejects.toMatchObject({
+      status: 422,
+      message: expect.stringContaining("approved PRD/plan reference"),
+    });
+  }, 20_000);
+
+  it("rejects direct in_progress creation without a PRD link or exemption", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+
+    await expect(svc.create(companyId, {
+      title: "Change Paperclip issue checkout",
+      description: "platform_change: true",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+    })).rejects.toMatchObject({
+      status: 422,
+      message: expect.stringContaining("approved PRD/plan reference"),
+    });
+  }, 20_000);
 });

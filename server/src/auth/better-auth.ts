@@ -78,6 +78,13 @@ export function deriveAuthTrustedOrigins(config: Config): string[] {
       if (!trimmed) continue;
       trustedOrigins.add(`https://${trimmed}`);
       trustedOrigins.add(`http://${trimmed}`);
+      // If hostname doesn't include a port, also add with the server port
+      // (browsers send origin with port for non-standard ports like 3100)
+      if (!trimmed.includes(":")) {
+        const serverPort = config.port ?? 3100;
+        trustedOrigins.add(`https://${trimmed}:${serverPort}`);
+        trustedOrigins.add(`http://${trimmed}:${serverPort}`);
+      }
     }
   }
 

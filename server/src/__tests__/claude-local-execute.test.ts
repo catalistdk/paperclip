@@ -6,12 +6,13 @@ import { execute } from "@paperclipai/adapter-claude-local/server";
 
 async function writeFailingClaudeCommand(
   commandPath: string,
-  options: { resultEvent: Record<string, unknown>; exitCode?: number },
+  options: { resultEvent: Record<string, unknown>; exitCode?: number; stderr?: string },
 ): Promise<void> {
   const payload = JSON.stringify(options.resultEvent);
   const exit = options.exitCode ?? 1;
   const script = `#!/usr/bin/env node
 console.log(${JSON.stringify(payload)});
+${options.stderr ? `console.error(${JSON.stringify(options.stderr)});` : ""}
 process.exit(${exit});
 `;
   await fs.writeFile(commandPath, script, "utf8");
@@ -777,6 +778,62 @@ describe("claude execute", () => {
       expect(result.retryNotBefore ?? null).toBeNull();
       expect(result.resultJson?.retryNotBefore ?? null).toBeNull();
       expect(result.resultJson?.transientRetryNotBefore ?? null).toBeNull();
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("copies Claude parsed failure output into stderr diagnostics when process stderr is empty", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-diagnostics-"));
+    const workspace = path.join(root, "workspace");
+    const commandPath = path.join(root, "claude");
+    await fs.mkdir(workspace, { recursive: true });
+    await writeFailingClaudeCommand(commandPath, {
+      resultEvent: {
+        type: "result",
+        subtype: "error",
+        session_id: "claude-session-auth",
+        is_error: true,
+        result: "OAuth token expired: invalid_request_error from Anthropic API",
+        errors: [{ type: "invalid_request_error", message: "OAuth token expired" }],
+      },
+    });
+
+    const previousHome = process.env.HOME;
+    process.env.HOME = root;
+
+    try {
+      const result = await execute({
+        runId: "run-claude-diagnostics",
+        agent: {
+          id: "agent-1",
+          companyId: "company-1",
+          name: "Claude Coder",
+          adapterType: "claude_local",
+          adapterConfig: {},
+        },
+        runtime: {
+          sessionId: null,
+          sessionParams: null,
+          sessionDisplayId: null,
+          taskKey: null,
+        },
+        config: {
+          command: commandPath,
+          cwd: workspace,
+          promptTemplate: "Follow the paperclip heartbeat.",
+        },
+        context: {},
+        authToken: "run-jwt-token",
+        onLog: async () => {},
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.errorMessage).toContain("OAuth token expired");
+      expect(result.resultJson?.stderr).toContain("OAuth token expired");
+      expect(result.resultJson?.stdout).toContain("OAuth token expired");
     } finally {
       if (previousHome === undefined) delete process.env.HOME;
       else process.env.HOME = previousHome;
