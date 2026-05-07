@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import { and, asc, desc, eq, gt, inArray, isNull, lt, ne, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNull, like, lt, ne, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
@@ -28,12 +28,24 @@ import {
   projects,
 } from "@paperclipai/db";
 import type {
+  IssueCommentAuthorType,
+  IssueCommentMetadata,
+  IssueCommentPresentation,
   IssueBlockerAttention,
   IssueProductivityReview,
   IssueProductivityReviewTrigger,
   IssueRelationIssueSummary,
 } from "@paperclipai/shared";
-import { clampIssueRequestDepth, extractAgentMentionIds, extractProjectMentionIds, isUuidLike } from "@paperclipai/shared";
+import {
+  clampIssueRequestDepth,
+  extractAgentMentionIds,
+  extractProjectMentionIds,
+  issueCommentAuthorTypeSchema,
+  issueCommentMetadataSchema,
+  issueCommentPresentationSchema,
+  isUuidLike,
+  normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
+} from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { parseObject } from "../adapters/utils.js";
 import {
@@ -309,9 +321,11 @@ export interface IssueFilters {
   descendantOf?: string;
   labelId?: string;
   originKind?: string;
+  originKindPrefix?: string;
   originId?: string;
   includeRoutineExecutions?: boolean;
   excludeRoutineExecutions?: boolean;
+  includePluginOperations?: boolean;
   includeBlockedBy?: boolean;
   q?: string;
   limit?: number;
@@ -743,6 +757,19 @@ function inboxVisibleForUserCondition(companyId: string, userId: string) {
         AND ${issueInboxArchives.archivedAt} >= ${issueLastActivityAt}
     )
   `;
+}
+
+function nonPluginOperationIssueCondition() {
+  return sql<boolean>`NOT (${issues.originKind} LIKE 'plugin:%:operation' OR ${issues.originKind} LIKE 'plugin:%:operation:%')`;
+}
+
+function shouldIncludePluginOperationIssues(filters: IssueFilters | undefined) {
+  return Boolean(
+    filters?.includePluginOperations ||
+    filters?.originKind ||
+    filters?.originId ||
+    filters?.projectId,
+  );
 }
 
 /** Named entities commonly emitted in saved issue bodies; unknown `&name;` sequences are left unchanged. */
@@ -1591,6 +1618,7 @@ const issueListSelect = {
     END
   `,
   status: issues.status,
+  workMode: issues.workMode,
   priority: issues.priority,
   assigneeAgentId: issues.assigneeAgentId,
   assigneeUserId: issues.assigneeUserId,
@@ -1846,10 +1874,47 @@ export function issueService(db: Db) {
     return enriched;
   }
 
-  function redactIssueComment<T extends { body: string }>(comment: T, censorUsernameInLogs: boolean): T {
+  function deriveIssueCommentAuthorType(comment: {
+    authorType?: string | null;
+    authorAgentId?: string | null;
+    authorUserId?: string | null;
+  }): IssueCommentAuthorType {
+    const explicit = issueCommentAuthorTypeSchema.safeParse(comment.authorType);
+    if (explicit.success) return explicit.data;
+    if (comment.authorAgentId) return "agent";
+    if (comment.authorUserId) return "user";
+    return "system";
+  }
+
+  function assertIssueCommentAuthorTypeAllowed(
+    actor: { agentId?: string | null; userId?: string | null },
+    authorType: IssueCommentAuthorType,
+  ) {
+    if (actor.agentId && authorType !== "agent") {
+      throw unprocessable("Comment authorType must match authenticated actor");
+    }
+    if (actor.userId && authorType !== "user") {
+      throw unprocessable("Comment authorType must match authenticated actor");
+    }
+    if (!actor.agentId && !actor.userId && authorType !== "system") {
+      throw unprocessable("System comments cannot use user or agent authorType without an author id");
+    }
+  }
+
+  function redactIssueComment<T extends { body: string; authorType?: string | null; authorAgentId?: string | null; authorUserId?: string | null; presentation?: unknown; metadata?: unknown }>(
+    comment: T,
+    censorUsernameInLogs: boolean,
+  ): T & {
+    authorType: IssueCommentAuthorType;
+    presentation: IssueCommentPresentation | null;
+    metadata: IssueCommentMetadata | null;
+  } {
     return {
       ...comment,
+      authorType: deriveIssueCommentAuthorType(comment),
       body: redactCurrentUserText(comment.body, { enabled: censorUsernameInLogs }),
+      presentation: issueCommentPresentationSchema.nullable().catch(null).parse(comment.presentation ?? null),
+      metadata: issueCommentMetadataSchema.nullable().catch(null).parse(comment.metadata ?? null),
     };
   }
 
@@ -2383,7 +2448,11 @@ export function issueService(db: Db) {
       }
       if (filters?.parentId) conditions.push(eq(issues.parentId, filters.parentId));
       if (filters?.originKind) conditions.push(eq(issues.originKind, filters.originKind));
+      if (filters?.originKindPrefix) conditions.push(like(issues.originKind, `${filters.originKindPrefix}%`));
       if (filters?.originId) conditions.push(eq(issues.originId, filters.originId));
+      if (!shouldIncludePluginOperationIssues(filters)) {
+        conditions.push(nonPluginOperationIssueCondition());
+      }
       if (filters?.labelId) {
         const labeledIssueIds = await db
           .select({ issueId: issueLabels.issueId })
@@ -2515,6 +2584,7 @@ export function issueService(db: Db) {
       const conditions = [
         eq(issues.companyId, companyId),
         isNull(issues.hiddenAt),
+        nonPluginOperationIssueCondition(),
         unreadForUserCondition(companyId, userId),
       ];
       if (status) {
@@ -2606,8 +2676,9 @@ export function issueService(db: Db) {
 
     getById: async (raw: string) => {
       const id = raw.trim();
-      if (/^[A-Z]+-\d+$/i.test(id)) {
-        return getIssueByIdentifier(id);
+      const identifier = normalizeIssueReferenceIdentifier(id);
+      if (identifier) {
+        return getIssueByIdentifier(identifier);
       }
       if (!isUuidLike(id)) {
         return null;
@@ -3938,6 +4009,12 @@ export function issueService(db: Db) {
       issueId: string,
       body: string,
       actor: { agentId?: string; userId?: string; runId?: string | null },
+      options?: {
+        authorType?: IssueCommentAuthorType | null;
+        presentation?: IssueCommentPresentation | null;
+        metadata?: IssueCommentMetadata | null;
+        createdAt?: Date | string | null;
+      },
     ) => {
       const issue = await db
         .select({ companyId: issues.companyId })
@@ -3951,6 +4028,13 @@ export function issueService(db: Db) {
         enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
       };
       const redactedBody = redactCurrentUserText(body, currentUserRedactionOptions);
+      const authorType = issueCommentAuthorTypeSchema.parse(
+        options?.authorType ?? (actor.agentId ? "agent" : actor.userId ? "user" : "system"),
+      );
+      assertIssueCommentAuthorTypeAllowed(actor, authorType);
+      const presentation = issueCommentPresentationSchema.nullable().parse(options?.presentation ?? null);
+      const metadata = issueCommentMetadataSchema.nullable().parse(options?.metadata ?? null);
+      const createdAt = options?.createdAt ? new Date(options.createdAt) : null;
       const [comment] = await db
         .insert(issueComments)
         .values({
@@ -3958,8 +4042,12 @@ export function issueService(db: Db) {
           issueId,
           authorAgentId: actor.agentId ?? null,
           authorUserId: actor.userId ?? null,
+          authorType,
           createdByRunId: actor.runId ?? null,
           body: redactedBody,
+          presentation,
+          metadata,
+          ...(createdAt && !Number.isNaN(createdAt.getTime()) ? { createdAt } : {}),
         })
         .returning();
 
