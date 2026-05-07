@@ -78,6 +78,12 @@ export const runningProcesses = new Map<string, RunningProcess>();
 export const MAX_CAPTURE_BYTES = 4 * 1024 * 1024;
 export const MAX_EXCERPT_BYTES = 32 * 1024;
 const TERMINAL_RESULT_SCAN_OVERLAP_CHARS = 64 * 1024;
+const SHUTDOWN_SIGNALS = ["SIGTERM", "SIGINT", "SIGHUP"] as const;
+const SIGNAL_EXIT_CODES: Partial<Record<NodeJS.Signals, number>> = {
+  SIGHUP: 129,
+  SIGINT: 130,
+  SIGTERM: 143,
+};
 const SENSITIVE_ENV_KEY = /(key|token|secret|password|passwd|authorization|cookie)/i;
 const REDACTED_LOG_VALUE = "***REDACTED***";
 const PAPERCLIP_SKILL_ROOT_RELATIVE_CANDIDATES = [
@@ -87,6 +93,33 @@ const PAPERCLIP_SKILL_ROOT_RELATIVE_CANDIDATES = [
 const MATERIALIZED_SKILL_SENTINEL = ".paperclip-materialized-skill.json";
 const MATERIALIZED_SKILL_LOCK_OWNER = "owner.json";
 const MATERIALIZED_SKILL_LOCK_STALE_MS = 30_000;
+let shutdownReaperRegistered = false;
+
+export function reapRunningProcessesForShutdown(signal: NodeJS.Signals = "SIGTERM") {
+  for (const running of runningProcesses.values()) {
+    signalRunningProcess(running, signal);
+  }
+}
+
+export function registerShutdownReaperOnce() {
+  if (shutdownReaperRegistered) return;
+  shutdownReaperRegistered = true;
+
+  process.once("exit", () => {
+    reapRunningProcessesForShutdown("SIGTERM");
+  });
+
+  for (const signal of SHUTDOWN_SIGNALS) {
+    const hadExistingListeners = process.listenerCount(signal) > 0;
+    process.once(signal, () => {
+      reapRunningProcessesForShutdown(signal);
+
+      if (!hadExistingListeners) {
+        process.exit(SIGNAL_EXIT_CODES[signal] ?? 1);
+      }
+    });
+  }
+}
 
 export const DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE = [
   "You are agent {{agent.id}} ({{agent.name}}). Continue your Paperclip work.",
@@ -1837,6 +1870,7 @@ export async function runChildProcess(
             })
             : Promise.resolve();
 
+        registerShutdownReaperOnce();
         runningProcesses.set(runId, { child, graceSec: opts.graceSec, processGroupId });
 
         let timedOut = false;

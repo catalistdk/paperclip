@@ -2,13 +2,15 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   applyPaperclipWorkspaceEnv,
   appendWithByteCap,
   buildInvocationEnvForLogs,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   materializePaperclipSkillCopy,
+  reapRunningProcessesForShutdown,
+  registerShutdownReaperOnce,
   renderPaperclipWakePrompt,
   runningProcesses,
   runChildProcess,
@@ -199,6 +201,55 @@ describe("materializePaperclipSkillCopy", () => {
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe("shutdown reaper", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    runningProcesses.clear();
+  });
+
+  it.skipIf(process.platform === "win32")("signals detached process groups before falling back to direct children", () => {
+    const directKill = vi.fn();
+    const processKill = vi.spyOn(process, "kill").mockImplementation((pid, signal) => {
+      if (pid === -1234) return true;
+      if (pid === -5678) {
+        throw new Error("missing process group");
+      }
+      return true;
+    });
+
+    runningProcesses.set("group-ok", {
+      child: { killed: false, kill: directKill } as never,
+      graceSec: 1,
+      processGroupId: 1234,
+    });
+    runningProcesses.set("group-fallback", {
+      child: { killed: false, kill: directKill } as never,
+      graceSec: 1,
+      processGroupId: 5678,
+    });
+
+    reapRunningProcessesForShutdown("SIGHUP");
+
+    expect(processKill).toHaveBeenCalledWith(-1234, "SIGHUP");
+    expect(processKill).toHaveBeenCalledWith(-5678, "SIGHUP");
+    expect(directKill).toHaveBeenCalledTimes(1);
+    expect(directKill).toHaveBeenCalledWith("SIGHUP");
+  });
+
+  it("registers shutdown listeners once", () => {
+    const processOnce = vi.spyOn(process, "once").mockImplementation(() => process);
+
+    registerShutdownReaperOnce();
+    registerShutdownReaperOnce();
+
+    expect(processOnce).toHaveBeenCalledTimes(4);
+    expect(processOnce).toHaveBeenCalledWith("exit", expect.any(Function));
+    expect(processOnce).toHaveBeenCalledWith("SIGTERM", expect.any(Function));
+    expect(processOnce).toHaveBeenCalledWith("SIGINT", expect.any(Function));
+    expect(processOnce).toHaveBeenCalledWith("SIGHUP", expect.any(Function));
   });
 });
 
