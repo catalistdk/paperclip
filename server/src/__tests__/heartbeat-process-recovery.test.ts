@@ -1258,6 +1258,132 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(comments).toHaveLength(0);
   });
 
+  it("downgrades wrapper success subtype when no same-run verdict comment landed and clears checkout lock", async () => {
+    mockAdapterExecute.mockResolvedValueOnce({
+      exitCode: 1,
+      signal: "SIGTERM",
+      timedOut: false,
+      errorCode: "claude_transient_upstream",
+      errorFamily: "transient_upstream",
+      errorMessage: "Claude run failed: subtype=success",
+      provider: "anthropic",
+      model: "claude",
+      resultJson: {
+        failureSubtype: "subtype_success",
+      },
+    });
+
+    const { runId, issueId } = await seedQueuedIssueRunFixture();
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, runId);
+
+    const run = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    expect(run?.status).toBe("failed");
+    expect(run?.errorCode).toBe("success_unconfirmed");
+    expect(run?.resultJson).toMatchObject({
+      failureSubtype: "success_unconfirmed",
+      subtype: "success_unconfirmed",
+      originalFailureSubtype: "subtype_success",
+      wrapperSubtypeLie: true,
+    });
+
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("in_progress");
+    expect(issue?.checkoutRunId).toBeNull();
+
+    const auditRows = await db
+      .select()
+      .from(activityLog)
+      .where(and(eq(activityLog.runId, runId), eq(activityLog.action, "wrapper_subtype_lie")));
+    expect(auditRows).toHaveLength(1);
+    expect(auditRows[0]?.details).toMatchObject({
+      runId,
+      targetIssueId: issueId,
+    });
+
+    const reconcileRows = await db
+      .select()
+      .from(activityLog)
+      .where(and(eq(activityLog.runId, runId), eq(activityLog.action, "issue_checkout_run_reconciled")));
+    expect(reconcileRows).toHaveLength(1);
+  });
+
+  it("keeps wrapper success subtype confirmed when a same-run issue comment landed", async () => {
+    mockAdapterExecute.mockImplementationOnce(async (ctx: { runId: string }) => {
+      const run = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, ctx.runId))
+        .then((rows) => rows[0] ?? null);
+      const issueId = (run?.contextSnapshot as Record<string, unknown> | null)?.issueId as string;
+      await db.insert(issueComments).values({
+        id: randomUUID(),
+        companyId: run!.companyId,
+        issueId,
+        body: "Done\n\nVerified and handing back.",
+        createdByAgentId: run!.agentId,
+        createdByRunId: ctx.runId,
+        createdAt: new Date("2026-03-19T00:00:30.000Z"),
+      });
+      return {
+        exitCode: 1,
+        signal: "SIGTERM",
+        timedOut: false,
+        errorCode: "claude_transient_upstream",
+        errorFamily: "transient_upstream",
+        errorMessage: "Claude run failed: subtype=success",
+        provider: "anthropic",
+        model: "claude",
+        resultJson: {
+          failureSubtype: "subtype_success",
+        },
+      };
+    });
+
+    const { runId, issueId } = await seedQueuedIssueRunFixture();
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, runId);
+
+    const run = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    expect(run?.status).toBe("failed");
+    expect(run?.errorCode).toBe("claude_transient_upstream");
+
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue?.checkoutRunId).toBeNull();
+
+    const lieRows = await db
+      .select()
+      .from(activityLog)
+      .where(and(eq(activityLog.runId, runId), eq(activityLog.action, "wrapper_subtype_lie")));
+    expect(lieRows).toHaveLength(0);
+
+    const confirmedRows = await db
+      .select()
+      .from(activityLog)
+      .where(and(eq(activityLog.runId, runId), eq(activityLog.action, "lifecycle_recovery_engaged.exit_143_subtype_success")));
+    expect(confirmedRows).toHaveLength(1);
+  });
+
   it("queues one finish-handoff wake when a successful run leaves in-progress work without a next action", async () => {
     const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture();
     mockAdapterExecute.mockImplementationOnce(async (ctx: { runId: string }) => {

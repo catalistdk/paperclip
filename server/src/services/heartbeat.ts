@@ -3,7 +3,7 @@ import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { randomUUID } from "node:crypto";
-import { and, asc, desc, eq, getTableColumns, gt, inArray, isNull, lt, lte, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNull, lt, lte, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
@@ -999,6 +999,57 @@ export function prioritizeProjectWorkspaceCandidatesForRun<T extends ProjectWork
 
 function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+function containsWrapperSuccessSubtype(value: unknown) {
+  if (typeof value !== "string") return false;
+  const normalized = value.trim().toLowerCase();
+  return (
+    normalized === "success" ||
+    normalized === "subtype_success" ||
+    normalized === "exit_143_subtype_success" ||
+    normalized.includes("subtype=success") ||
+    normalized.includes("subtype_success")
+  );
+}
+
+function hasWrapperSuccessSubtypeSignal(input: {
+  error: string | null | undefined;
+  errorCode: string | null | undefined;
+  resultJson: Record<string, unknown> | null | undefined;
+}) {
+  const result = input.resultJson;
+  return (
+    containsWrapperSuccessSubtype(input.error) ||
+    containsWrapperSuccessSubtype(input.errorCode) ||
+    containsWrapperSuccessSubtype(result?.failureSubtype) ||
+    containsWrapperSuccessSubtype(result?.subtype) ||
+    containsWrapperSuccessSubtype(result?.type) ||
+    containsWrapperSuccessSubtype(result?.error) ||
+    containsWrapperSuccessSubtype(result?.message)
+  );
+}
+
+function runDurationSeconds(run: Pick<typeof heartbeatRuns.$inferSelect, "startedAt" | "createdAt" | "finishedAt">) {
+  const start = run.startedAt ?? run.createdAt;
+  const finish = run.finishedAt ?? new Date();
+  return Math.max(0, Math.round((new Date(finish).getTime() - new Date(start).getTime()) / 1000));
+}
+
+function mergeRunWrapperSubtype(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "resultJson" | "errorCode">,
+  subtype: string,
+) {
+  const resultJson = parseObject(run.resultJson);
+  return {
+    ...resultJson,
+    failureSubtype: subtype,
+    subtype,
+    originalFailureSubtype:
+      readNonEmptyString(resultJson.failureSubtype) ??
+      readNonEmptyString(resultJson.subtype) ??
+      readNonEmptyString(run.errorCode),
+  };
 }
 
 function readModelProfileKey(value: unknown): ModelProfileKey | null {
@@ -4328,6 +4379,148 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .then((rows) => rows[0] ?? null);
   }
 
+  async function findRunIssueCommentInRunWindow(run: typeof heartbeatRuns.$inferSelect, issueId: string) {
+    const startedAt = run.startedAt ?? run.createdAt;
+    const finishedAt = run.finishedAt ?? new Date();
+    return db
+      .select({
+        id: issueComments.id,
+        createdAt: issueComments.createdAt,
+      })
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.companyId, run.companyId),
+          eq(issueComments.issueId, issueId),
+          eq(issueComments.createdByRunId, run.id),
+          gte(issueComments.createdAt, startedAt),
+          lte(issueComments.createdAt, finishedAt),
+        ),
+      )
+      .orderBy(desc(issueComments.createdAt), desc(issueComments.id))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+  }
+
+  async function reconcileTerminalIssueCheckoutRun(run: typeof heartbeatRuns.$inferSelect) {
+    const contextSnapshot = parseObject(run.contextSnapshot);
+    const issueId = readNonEmptyString(contextSnapshot.issueId);
+    if (!issueId) return null;
+
+    const [updated] = await db
+      .update(issues)
+      .set({
+        checkoutRunId: null,
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(issues.companyId, run.companyId),
+          eq(issues.id, issueId),
+          eq(issues.checkoutRunId, run.id),
+        ),
+      )
+      .returning({
+        id: issues.id,
+        identifier: issues.identifier,
+      });
+
+    if (!updated) return null;
+
+    await logActivity(db, {
+      companyId: run.companyId,
+      actorType: "system",
+      actorId: "heartbeat",
+      agentId: run.agentId,
+      runId: run.id,
+      action: "issue_checkout_run_reconciled",
+      entityType: "issue",
+      entityId: updated.id,
+      details: {
+        identifier: updated.identifier,
+        terminalRunStatus: run.status,
+        checkoutRunId: run.id,
+      },
+    });
+
+    return updated;
+  }
+
+  async function confirmOrDowngradeWrapperSuccessSubtype(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    issueId: string;
+    seq: number;
+  }) {
+    const confirmedComment = await findRunIssueCommentInRunWindow(input.run, input.issueId);
+    if (confirmedComment) {
+      await logActivity(db, {
+        companyId: input.run.companyId,
+        actorType: "system",
+        actorId: "heartbeat",
+        agentId: input.run.agentId,
+        runId: input.run.id,
+        action: "lifecycle_recovery_engaged.exit_143_subtype_success",
+        entityType: "heartbeat_run",
+        entityId: input.run.id,
+        details: {
+          targetIssueId: input.issueId,
+          commentId: confirmedComment.id,
+          delta_seconds: runDurationSeconds(input.run),
+        },
+      });
+      await appendRunEvent(input.run, input.seq, {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "info",
+        message: "Confirmed wrapper success subtype from same-run issue comment",
+        payload: {
+          targetIssueId: input.issueId,
+          commentId: confirmedComment.id,
+        },
+      });
+      return { kind: "confirmed" as const, run: input.run };
+    }
+
+    const downgradedResultJson = mergeRunWrapperSubtype(input.run, "success_unconfirmed");
+    const downgradedRun = await setRunStatus(input.run.id, input.run.status, {
+      errorCode: "success_unconfirmed",
+      resultJson: {
+        ...downgradedResultJson,
+        wrapperSubtypeLie: true,
+      },
+    }) ?? input.run;
+
+    await logActivity(db, {
+      companyId: input.run.companyId,
+      actorType: "system",
+      actorId: "heartbeat",
+      agentId: input.run.agentId,
+      runId: input.run.id,
+      action: "wrapper_subtype_lie",
+      entityType: "heartbeat_run",
+      entityId: input.run.id,
+      details: {
+        runId: input.run.id,
+        agentId: input.run.agentId,
+        targetIssueId: input.issueId,
+        delta_seconds: runDurationSeconds(input.run),
+        originalErrorCode: input.run.errorCode,
+      },
+    });
+    await appendRunEvent(downgradedRun, input.seq, {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "warn",
+      message: "Downgraded wrapper success subtype because no same-run issue comment landed",
+      payload: {
+        targetIssueId: input.issueId,
+        downgradedSubtype: "success_unconfirmed",
+      },
+    });
+
+    return { kind: "downgraded" as const, run: downgradedRun };
+  }
+
   async function refreshContinuationSummaryForRun(
     run: typeof heartbeatRuns.$inferSelect,
     agent: typeof agents.$inferSelect,
@@ -7564,22 +7757,44 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         logSha256: logSummary?.sha256,
         logCompressed: logSummary?.compressed ?? false,
       });
-      if (persistedRun) {
-        persistedRun = await classifyAndPersistRunLiveness(persistedRun, persistedResultJson) ?? persistedRun;
-      }
-
-      await setWakeupStatus(run.wakeupRequestId, outcome === "succeeded" ? "completed" : status, {
-        finishedAt: new Date(),
-        error: runErrorMessage,
-      });
-
-      const finalizedRun = persistedRun ?? (await getRun(run.id));
+      let effectiveOutcome = outcome;
+      let effectiveWakeupStatus = outcome === "succeeded" ? "completed" : status;
+      let effectiveWakeupError = runErrorMessage;
+      let finalizedRun = persistedRun ?? (await getRun(run.id));
       if (finalizedRun) {
+        if (issueId && hasWrapperSuccessSubtypeSignal({
+          error: finalizedRun.error,
+          errorCode: finalizedRun.errorCode,
+          resultJson: parseObject(finalizedRun.resultJson),
+        })) {
+          const wrapperSubtype = await confirmOrDowngradeWrapperSuccessSubtype({
+            run: finalizedRun,
+            issueId,
+            seq,
+          });
+          seq += 1;
+          finalizedRun = wrapperSubtype.run;
+          if (wrapperSubtype.kind === "confirmed") {
+            effectiveOutcome = "succeeded";
+            effectiveWakeupStatus = "completed";
+            effectiveWakeupError = null;
+          }
+        }
+
+        finalizedRun = await classifyAndPersistRunLiveness(
+          finalizedRun,
+          parseObject(finalizedRun.resultJson),
+        ) ?? finalizedRun;
+        await reconcileTerminalIssueCheckoutRun(finalizedRun);
+        await setWakeupStatus(run.wakeupRequestId, effectiveWakeupStatus, {
+          finishedAt: new Date(),
+          error: effectiveWakeupError,
+        });
         await appendRunEvent(finalizedRun, seq++, {
           eventType: "lifecycle",
           stream: "system",
-          level: outcome === "succeeded" ? "info" : "error",
-          message: `run ${outcome}`,
+          level: effectiveOutcome === "succeeded" ? "info" : "error",
+          message: `run ${effectiveOutcome}`,
           payload: {
             status,
             exitCode: adapterResult.exitCode,
@@ -7665,7 +7880,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
         }
       }
-      await finalizeAgentStatus(agent.id, outcome);
+      await finalizeAgentStatus(agent.id, effectiveOutcome);
     } catch (err) {
       const message = redactCurrentUserText(
         err instanceof Error ? err.message : "Unknown adapter failure",
@@ -7716,6 +7931,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           message,
         });
         const livenessRun = await classifyAndPersistRunLiveness(failedRun) ?? failedRun;
+        await reconcileTerminalIssueCheckoutRun(livenessRun);
         await refreshContinuationSummaryForRun(livenessRun, agent);
         await finalizeIssueCommentPolicy(livenessRun, agent);
         await releaseIssueExecutionAndPromote(livenessRun);
