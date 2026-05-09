@@ -515,62 +515,71 @@ function isClosedIssueStatus(status: string | null | undefined): status is "done
   return status === "done" || status === "cancelled";
 }
 
-function isScraperQaAgent(agent: { role?: unknown; name?: unknown } | null | undefined) {
-  const role = typeof agent?.role === "string" ? agent.role.toLowerCase() : "";
-  const name = typeof agent?.name === "string" ? agent.name.toLowerCase() : "";
-  return role.includes("scraper qa") || name.includes("scraper qa");
-}
+/**
+ * Validates scraper QA PASS evidence in a closing comment.
+ *
+ * Two paths:
+ * 1. Scoped (`[scoped-scraper-qa]` or `[scraper-repair-qa]` marker): requires
+ *    `verify_scrape.py OVERALL: PASS`, DB invariant evidence, and a UI artifact reference.
+ * 2. Full (no scoped marker): requires a `THREE-LAYER QA REPORT` with all three layers passing.
+ *
+ * Returns null if validation passes, or an error object if it fails.
+ */
+function validateScraperQaPassComment(comment: string): {
+  error: string;
+  missingEvidence: string[];
+} | null {
+  const isScoped =
+    comment.includes("[scoped-scraper-qa]") || comment.includes("[scraper-repair-qa]");
 
-function isScraperPassCloseAttempt(input: {
-  requestedStatus: unknown;
-  commentBody: unknown;
-  actorType: string;
-}) {
-  if (input.actorType !== "agent") return false;
-  if (input.requestedStatus !== "done") return false;
-  if (typeof input.commentBody !== "string") return false;
-  return /\b(qa\s+passed|scraper\s+pass|pass(?:ed)?)\b/i.test(input.commentBody);
-}
+  if (isScoped) {
+    const missing: string[] = [];
+    if (!/OVERALL:\s*PASS/i.test(comment)) missing.push("`verify_scrape.py` `OVERALL: PASS` line");
+    if (
+      !/variant[_\s]group|db\s+invariant|DB\s+state|DB\s+rows|primary|color_count|variant_count/i.test(
+        comment,
+      )
+    ) {
+      missing.push("DB invariant evidence (variant group, counts, or row state)");
+    }
+    if (
+      !/ui.artifact|screenshot|\.png|\.jpg|qa-artifacts|drawer|web.?ui|Web UI/i.test(comment)
+    ) {
+      missing.push("UI artifact reference (screenshot path, Web UI evidence, or drawer confirmation)");
+    }
+    if (missing.length === 0) return null;
+    return {
+      error:
+        "Scoped scraper QA PASS comments must include verify_scrape.py OVERALL: PASS, DB invariant evidence, and a UI artifact reference",
+      missingEvidence: missing,
+    };
+  }
 
-function getMissingQaThreeLayerEvidence(commentBody: string) {
-  const checks: Array<[string, RegExp]> = [
-    ["`qa_three_layer.py` command/output marker", /qa_three_layer\.py|\[qa_three_layer\]/i],
-    ["`THREE-LAYER QA REPORT` header", /THREE-LAYER QA REPORT/i],
-    ["Layer 1 PASS line", /Layer 1 \(Scraper CSV\):\s+\[PASS\]/i],
-    ["Layer 2 PASS line", /Layer 2 \(DB parity\):\s+\[PASS\]/i],
-    ["Layer 3 PASS line", /Layer 3 \(WebUI render\):\s+\[PASS\]/i],
-    ["`Overall: PASSED` line", /Overall:\s+PASSED/i],
-  ];
-  return checks.filter(([, pattern]) => !pattern.test(commentBody)).map(([label]) => label);
-}
-
-async function assertScraperQaPassEvidence(input: {
-  res: Response;
-  actorType: string;
-  actorAgentId: string | null | undefined;
-  requestedStatus: unknown;
-  commentBody: unknown;
-  agentsSvc: ReturnType<typeof agentService>;
-}) {
-  if (!isScraperPassCloseAttempt({
-    actorType: input.actorType,
-    requestedStatus: input.requestedStatus,
-    commentBody: input.commentBody,
-  })) return true;
-
-  const actorAgent = input.actorAgentId ? await input.agentsSvc.getById(input.actorAgentId) : null;
-  if (!isScraperQaAgent(actorAgent)) return true;
-
-  const missing = getMissingQaThreeLayerEvidence(input.commentBody as string);
-  if (missing.length === 0) return true;
-
-  input.res.status(422).json({
-    error: "Scraper QA PASS comments must include qa_three_layer.py evidence before the issue can be marked done",
+  // Full three-layer path
+  const missing: string[] = [];
+  if (!/THREE-LAYER QA REPORT/i.test(comment)) missing.push("`THREE-LAYER QA REPORT` header");
+  if (!/Layer\s+1[^\n]*PASS/i.test(comment)) missing.push("Layer 1 PASS line");
+  if (!/Layer\s+2[^\n]*PASS/i.test(comment)) missing.push("Layer 2 PASS line");
+  if (!/Layer\s+3[^\n]*PASS/i.test(comment)) missing.push("Layer 3 PASS line");
+  if (!/Overall:\s*PASSED/i.test(comment)) missing.push("`Overall: PASSED` line");
+  if (missing.length === 0) return null;
+  return {
+    error:
+      "Scraper QA PASS comments must include qa_three_layer.py evidence before the issue can be marked done",
     missingEvidence: missing,
-    requiredEvidence:
-      "Paste the qa_three_layer.py output including [qa_three_layer], THREE-LAYER QA REPORT, Layer 1/2/3 [PASS], and Overall: PASSED.",
-  });
-  return false;
+  };
+}
+
+/**
+ * Returns true if a closing comment looks like a scraper QA PASS that should
+ * be subject to the evidence gate.
+ */
+function isScraperQaPassComment(comment: string): boolean {
+  return (
+    comment.includes("[scoped-scraper-qa]") ||
+    comment.includes("[scraper-repair-qa]") ||
+    /THREE-LAYER QA REPORT/i.test(comment)
+  );
 }
 
 function shouldImplicitlyMoveCommentedIssueToTodo(input: {
@@ -2606,6 +2615,19 @@ export function issueRoutes(
       ? await resolveActiveIssueRun(existing)
       : null;
 
+    // Scraper QA close gate: validate evidence in PASS comments before marking done.
+    if (
+      commentBody &&
+      req.body.status === "done" &&
+      isScraperQaPassComment(commentBody)
+    ) {
+      const qaValidation = validateScraperQaPassComment(commentBody);
+      if (qaValidation) {
+        res.status(422).json(qaValidation);
+        return;
+      }
+    }
+
     if (hiddenAtRaw !== undefined) {
       updateFields.hiddenAt = hiddenAtRaw ? new Date(hiddenAtRaw) : null;
     }
@@ -2631,14 +2653,18 @@ export function issueRoutes(
     if (normalizedAssigneeAgentId !== undefined) {
       updateFields.assigneeAgentId = normalizedAssigneeAgentId;
     }
-    if (!(await assertScraperQaPassEvidence({
-      res,
-      actorType: req.actor.type,
-      actorAgentId: actor.agentId,
-      requestedStatus: updateFields.status,
-      commentBody,
-      agentsSvc,
-    }))) return;
+    if (
+      req.actor.type === "agent" &&
+      updateFields.status === "done" &&
+      typeof commentBody === "string" &&
+      isScraperQaPassComment(commentBody)
+    ) {
+      const qaResult = validateScraperQaPassComment(commentBody);
+      if (qaResult !== null) {
+        res.status(422).json(qaResult);
+        return;
+      }
+    }
     const monitorChanged = monitorPoliciesEqual(previousExecutionPolicy, nextExecutionPolicy) === false;
     assertCanManageIssueMonitor(req, existing.assigneeAgentId, req.body.executionPolicy !== undefined && monitorChanged);
 

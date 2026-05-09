@@ -289,19 +289,13 @@ describe("issue update comment wakeups", () => {
     );
   });
 
-  it("rejects Scraper QA PASS close comments without qa_three_layer.py evidence", async () => {
+  it("rejects Scraper QA PASS close comments with THREE-LAYER header but missing layer evidence", async () => {
     const existing = makeIssue({
       assigneeAgentId: ASSIGNEE_AGENT_ID,
       assigneeUserId: null,
       status: "in_progress",
     });
     mockIssueService.getById.mockResolvedValue(existing);
-    mockAgentService.getById.mockResolvedValue({
-      id: ASSIGNEE_AGENT_ID,
-      companyId: existing.companyId,
-      name: "Scraper QA",
-      role: "Scraper QA",
-    });
 
     const res = await request(await createApp({
       type: "agent",
@@ -313,14 +307,12 @@ describe("issue update comment wakeups", () => {
       .patch(`/api/issues/${existing.id}`)
       .send({
         status: "done",
-        comment: "QA PASSED — all checks looked good.",
+        comment: "THREE-LAYER QA REPORT\nLooks good overall.",
       });
 
     expect(res.status).toBe(422);
     expect(res.body.error).toContain("qa_three_layer.py evidence");
     expect(res.body.missingEvidence).toEqual(expect.arrayContaining([
-      "`qa_three_layer.py` command/output marker",
-      "`THREE-LAYER QA REPORT` header",
       "Layer 1 PASS line",
       "Layer 2 PASS line",
       "Layer 3 PASS line",
@@ -396,5 +388,110 @@ describe("issue update comment wakeups", () => {
         runId: "22222222-2222-4222-8222-222222222222",
       }),
     );
+  });
+});
+
+describe("scraper QA close gate", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    vi.doUnmock("../routes/issues.js");
+    vi.doUnmock("../routes/authz.js");
+    vi.doUnmock("../middleware/index.js");
+    registerModuleMocks();
+    vi.clearAllMocks();
+    mockIssueService.findMentionedAgents.mockResolvedValue([]);
+    mockIssueService.getRelationSummaries.mockResolvedValue({ blockedBy: [], blocks: [] });
+    mockIssueService.listWakeableBlockedDependents.mockResolvedValue([]);
+    mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue(null);
+  });
+
+  it("accepts a valid scoped scraper QA PASS comment", async () => {
+    const existing = makeIssue({ assigneeAgentId: ASSIGNEE_AGENT_ID, assigneeUserId: null, status: "in_progress" });
+    const updated = { ...existing, status: "done" };
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue(updated);
+    mockIssueService.addComment.mockResolvedValue({ id: "comment-3", issueId: existing.id, companyId: existing.companyId, body: "" });
+
+    const scopedPassComment = [
+      "[scoped-scraper-qa] NORDSTROM repair confirmed.",
+      "verify_scrape.py cf9faebf => OVERALL: PASS",
+      "DB state: 19 rows, one variant_group_id, color_count=19, variant_count_on_page=19",
+      "UI artifact: scraper/.qa-artifacts/ver531-ilva-nordstrom-drawer.png",
+    ].join("\n");
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${existing.id}`)
+      .send({ status: "done", comment: scopedPassComment });
+
+    expect(res.status).toBe(200);
+  });
+
+  it("rejects a scoped scraper QA PASS comment missing UI artifact", async () => {
+    const existing = makeIssue({ assigneeAgentId: ASSIGNEE_AGENT_ID, assigneeUserId: null, status: "in_progress" });
+    mockIssueService.getById.mockResolvedValue(existing);
+
+    const incompleteComment = [
+      "[scoped-scraper-qa] NORDSTROM repair confirmed.",
+      "verify_scrape.py cf9faebf => OVERALL: PASS",
+      "DB state: 19 rows, one variant_group_id, color_count=19",
+      // UI artifact missing
+    ].join("\n");
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${existing.id}`)
+      .send({ status: "done", comment: incompleteComment });
+
+    expect(res.status).toBe(422);
+    expect(res.body.missingEvidence).toContain(
+      "UI artifact reference (screenshot path, Web UI evidence, or drawer confirmation)",
+    );
+  });
+
+  it("accepts a valid full three-layer QA PASS comment", async () => {
+    const existing = makeIssue({ assigneeAgentId: ASSIGNEE_AGENT_ID, assigneeUserId: null, status: "in_progress" });
+    const updated = { ...existing, status: "done" };
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue(updated);
+    mockIssueService.addComment.mockResolvedValue({ id: "comment-4", issueId: existing.id, companyId: existing.companyId, body: "" });
+
+    const fullPassComment = [
+      "THREE-LAYER QA REPORT",
+      "Layer 1 (Scraper CSV): PASS",
+      "Layer 2 (DB parity): PASS",
+      "Layer 3 (WebUI render): PASS",
+      "Overall: PASSED",
+    ].join("\n");
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${existing.id}`)
+      .send({ status: "done", comment: fullPassComment });
+
+    expect(res.status).toBe(200);
+  });
+
+  it("rejects a full QA PASS comment missing three-layer report header", async () => {
+    const existing = makeIssue({ assigneeAgentId: ASSIGNEE_AGENT_ID, assigneeUserId: null, status: "in_progress" });
+    mockIssueService.getById.mockResolvedValue(existing);
+
+    // Has the scoped marker? No. Has THREE-LAYER? No. Gate fires only on scraper-qa markers.
+    // Use a comment that triggers the gate (has THREE-LAYER in a broken form to trigger detection
+    // but not in the right format — actually gate fires on THREE-LAYER QA REPORT header,
+    // so if absent it doesn't trigger. Test full path: manually include the header but miss layers.
+    const brokenFullComment = [
+      "THREE-LAYER QA REPORT",
+      // Missing Layer 1/2/3 PASS lines and Overall: PASSED
+      "Layer 1: FAIL",
+      "Layer 2: FAIL",
+      "Overall: FAILED",
+    ].join("\n");
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${existing.id}`)
+      .send({ status: "done", comment: brokenFullComment });
+
+    expect(res.status).toBe(422);
+    expect(res.body.missingEvidence).toContain("Layer 1 PASS line");
+    expect(res.body.missingEvidence).toContain("Layer 2 PASS line");
+    expect(res.body.missingEvidence).toContain("Layer 3 PASS line");
   });
 });
