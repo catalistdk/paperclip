@@ -10,12 +10,14 @@ import {
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   materializePaperclipSkillCopy,
   reapRunningProcessesForShutdown,
+  refreshPaperclipWorkspaceEnvForExecution,
   registerShutdownReaperOnce,
   renderPaperclipWakePrompt,
   runningProcesses,
   runChildProcess,
   sanitizeSshRemoteEnv,
   shapePaperclipWorkspaceEnvForExecution,
+  rewriteWorkspaceCwdEnvVarsForExecution,
   stringifyPaperclipWakePayload,
 } from "./server-utils.js";
 
@@ -511,6 +513,50 @@ describe("renderPaperclipWakePrompt", () => {
     expect(prompt).toContain("named unblock owner/action");
   });
 
+  it("preserves Chinese, Japanese, and Hindi issue and comment text in scoped wake prompts", () => {
+    const title = "验证中文任务";
+    const commentBody = [
+      "请用中文回复。",
+      "日本語: 次の手順を書いてください。",
+      "हिन्दी: कृपया स्थिति बताएं।",
+    ].join("\n");
+    const payload = {
+      reason: "issue_commented",
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-9452",
+        title,
+        status: "in_progress",
+        workMode: "standard",
+      },
+      commentIds: ["comment-1"],
+      latestCommentId: "comment-1",
+      commentWindow: { requestedCount: 1, includedCount: 1, missingCount: 0 },
+      comments: [
+        {
+          id: "comment-1",
+          body: commentBody,
+          author: { type: "user", id: "board-user-1" },
+          createdAt: "2026-05-15T16:30:00.000Z",
+        },
+      ],
+      fallbackFetchNeeded: false,
+    };
+
+    const serialized = stringifyPaperclipWakePayload(payload);
+    expect(serialized).toContain(title);
+    expect(serialized).toContain("日本語");
+    expect(serialized).toContain("हिन्दी");
+    expect(JSON.parse(serialized ?? "{}")).toMatchObject({
+      issue: { title },
+      comments: [{ body: commentBody }],
+    });
+
+    const prompt = renderPaperclipWakePrompt(payload);
+    expect(prompt).toContain(`- issue: PAP-9452 ${title}`);
+    expect(prompt).toContain(commentBody);
+  });
+
   it("renders planning-mode directives for assignment and comment wakes", () => {
     const assignmentPrompt = renderPaperclipWakePrompt({
       reason: "issue_assigned",
@@ -858,6 +904,119 @@ describe("shapePaperclipWorkspaceEnvForExecution", () => {
       workspaceWorktreePath: "/tmp/worktree",
       workspaceHints,
     });
+  });
+});
+
+describe("rewriteWorkspaceCwdEnvVarsForExecution", () => {
+  it("rewrites custom *_WORKSPACE_CWD env vars for remote execution", () => {
+    const env = rewriteWorkspaceCwdEnvVarsForExecution({
+      workspaceCwd: "/host/workspace",
+      executionCwd: "/remote/workspace",
+      executionTargetIsRemote: true,
+      env: {
+        QA_PROJECT_WORKSPACE_CWD: "/host/workspace",
+        RANDOM_WORKSPACE_CWD: "/host/workspace",
+        OTHER_ENV: "/host/workspace",
+      },
+    });
+
+    expect(env).toEqual({
+      QA_PROJECT_WORKSPACE_CWD: "/remote/workspace",
+      RANDOM_WORKSPACE_CWD: "/remote/workspace",
+      OTHER_ENV: "/host/workspace",
+    });
+  });
+
+  it("does not rewrite matching values for local execution", () => {
+    const env = rewriteWorkspaceCwdEnvVarsForExecution({
+      workspaceCwd: "/host/workspace",
+      executionCwd: "/remote/workspace",
+      executionTargetIsRemote: false,
+      env: {
+        QA_PROJECT_WORKSPACE_CWD: "/host/workspace",
+        RANDOM_WORKSPACE_CWD_TOKEN: "/host/workspace",
+      },
+    });
+
+    expect(env).toEqual({
+      QA_PROJECT_WORKSPACE_CWD: "/host/workspace",
+      RANDOM_WORKSPACE_CWD_TOKEN: "/host/workspace",
+    });
+  });
+
+  it("only rewrites matching *_WORKSPACE_CWD string values", () => {
+    const env = rewriteWorkspaceCwdEnvVarsForExecution({
+      workspaceCwd: "/host/workspace",
+      executionCwd: "/remote/workspace",
+      executionTargetIsRemote: true,
+      env: {
+        MATCHING_WORKSPACE_CWD: "/host/workspace/.",
+        DIFFERENT_WORKSPACE_CWD: "/host/other-workspace",
+        BLANK_WORKSPACE_CWD: "   ",
+        NON_STRING_WORKSPACE_CWD: 42,
+      },
+    });
+
+    expect(env).toEqual({
+      MATCHING_WORKSPACE_CWD: "/remote/workspace",
+      DIFFERENT_WORKSPACE_CWD: "/host/other-workspace",
+      BLANK_WORKSPACE_CWD: "   ",
+    });
+  });
+});
+
+describe("refreshPaperclipWorkspaceEnvForExecution", () => {
+  it("rewrites Paperclip workspace env to the prepared remote runtime cwd", () => {
+    const env: Record<string, string> = {
+      PAPERCLIP_WORKSPACE_CWD: "/remote/workspace",
+      PAPERCLIP_WORKSPACE_WORKTREE_PATH: "/host/worktree",
+      PAPERCLIP_WORKSPACES_JSON: JSON.stringify([
+        { workspaceId: "workspace-1", cwd: "/remote/workspace" },
+        { workspaceId: "workspace-2", cwd: "/tmp/other" },
+      ]),
+      QA_PROJECT_WORKSPACE_CWD: "/remote/workspace",
+    };
+
+    const shaped = refreshPaperclipWorkspaceEnvForExecution({
+      env,
+      envConfig: {
+        QA_PROJECT_WORKSPACE_CWD: "/host/workspace",
+      },
+      workspaceCwd: "/host/workspace",
+      workspaceWorktreePath: "/host/worktree",
+      workspaceHints: [
+        { workspaceId: "workspace-1", cwd: "/host/workspace" },
+        { workspaceId: "workspace-2", cwd: "/tmp/other" },
+      ],
+      executionTargetIsRemote: true,
+      executionCwd: "/remote/workspace/.paperclip-runtime/runs/run-1/workspace",
+    });
+
+    expect(shaped).toEqual({
+      workspaceCwd: "/remote/workspace/.paperclip-runtime/runs/run-1/workspace",
+      workspaceWorktreePath: null,
+      workspaceHints: [
+        {
+          workspaceId: "workspace-1",
+          cwd: "/remote/workspace/.paperclip-runtime/runs/run-1/workspace",
+        },
+        {
+          workspaceId: "workspace-2",
+        },
+      ],
+    });
+    expect(env.PAPERCLIP_WORKSPACE_CWD).toBe("/remote/workspace/.paperclip-runtime/runs/run-1/workspace");
+    expect(env.PAPERCLIP_WORKSPACE_WORKTREE_PATH).toBeUndefined();
+    expect(env.QA_PROJECT_WORKSPACE_CWD).toBe("/remote/workspace/.paperclip-runtime/runs/run-1/workspace");
+    expect(JSON.parse(env.PAPERCLIP_WORKSPACES_JSON ?? "[]")).toEqual([
+      {
+        workspaceId: "workspace-1",
+        cwd: "/remote/workspace/.paperclip-runtime/runs/run-1/workspace",
+      },
+      {
+        workspaceId: "workspace-2",
+      },
+    ]);
   });
 });
 
