@@ -3097,7 +3097,20 @@ export function agentRoutes(
     assertCompanyAccess(req, companyId);
     const agentId = req.query.agentId as string | undefined;
     const limitParam = req.query.limit as string | undefined;
-    const limit = limitParam ? Math.max(1, Math.min(1000, parseInt(limitParam, 10) || 200)) : undefined;
+    if (!limitParam) {
+      res.status(400).json({ error: "limit is required and must be a positive integer" });
+      return;
+    }
+    if (!/^\d+$/.test(limitParam)) {
+      res.status(400).json({ error: "limit is required and must be a positive integer" });
+      return;
+    }
+    const parsedLimit = Number(limitParam);
+    if (!Number.isInteger(parsedLimit) || parsedLimit <= 0 || parsedLimit > 200) {
+      res.status(400).json({ error: "limit is required and must be a positive integer" });
+      return;
+    }
+    const limit = parsedLimit;
     const runs = await heartbeat.list(companyId, agentId, limit);
     res.json(runs);
   });
@@ -3352,6 +3365,7 @@ export function agentRoutes(
     }
     assertCompanyAccess(req, issue.companyId);
 
+    const limit = readLiveRunsQueryInt(req.query.limit, 200, 50);
     const liveRuns = await db
       .select({
         id: heartbeatRuns.id,
@@ -3387,7 +3401,8 @@ export function agentRoutes(
           sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
         ),
       )
-      .orderBy(desc(heartbeatRuns.createdAt));
+      .orderBy(desc(heartbeatRuns.createdAt))
+      .limit(limit);
 
     res.json(await Promise.all(liveRuns.map(async (run) => ({
       ...run,

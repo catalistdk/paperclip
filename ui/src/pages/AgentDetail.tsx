@@ -114,6 +114,7 @@ const runStatusIcons: Record<string, { icon: typeof CheckCircle2; color: string 
 const RUN_LOG_PAGE_BYTES = 256_000;
 
 const REDACTED_ENV_VALUE = "***REDACTED***";
+const AGENT_DETAIL_HEARTBEAT_RUN_LIMIT = 200;
 const SECRET_ENV_KEY_RE =
   /(api[-_]?key|access[-_]?token|auth(?:_?token)?|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring)/i;
 const COMMAND_ENV_KEY_RE = /(^command$|^cmd$|command[-_]?line|resolved[-_]?command|PAPERCLIP_RESOLVED_COMMAND)/i;
@@ -678,7 +679,7 @@ export function AgentDetail() {
 
   const { data: heartbeats } = useQuery({
     queryKey: queryKeys.heartbeats(resolvedCompanyId!, agent?.id ?? undefined),
-    queryFn: () => heartbeatsApi.list(resolvedCompanyId!, agent?.id ?? undefined),
+    queryFn: () => heartbeatsApi.list(resolvedCompanyId!, agent?.id ?? undefined, AGENT_DETAIL_HEARTBEAT_RUN_LIMIT),
     enabled: !!resolvedCompanyId && !!agent?.id && shouldLoadHeartbeats,
   });
 

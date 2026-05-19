@@ -10,6 +10,7 @@ const mockHeartbeatService = vi.hoisted(() => ({
   buildRunOutputSilence: vi.fn(),
   getRunIssueSummary: vi.fn(),
   getActiveRunIssueSummaryForAgent: vi.fn(),
+  list: vi.fn(),
   getRunLogAccess: vi.fn(),
   readLog: vi.fn(),
   wakeup: vi.fn(),
@@ -185,6 +186,7 @@ describe("agent live run routes", () => {
     });
     mockInstanceSettingsService.listCompanyIds.mockResolvedValue(["company-1"]);
     mockHeartbeatService.buildRunOutputSilence.mockResolvedValue(null);
+    mockHeartbeatService.list.mockResolvedValue([]);
     mockHeartbeatService.getRunIssueSummary.mockResolvedValue({
       id: "run-1",
       status: "running",
@@ -534,6 +536,28 @@ describe("agent live run routes", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body).toHaveLength(4);
     expect(db.select).toHaveBeenCalledTimes(2);
+  });
+
+  it("requires limit for heartbeat run list polling", async () => {
+    const res = await requestApp(
+      await createApp(),
+      (baseUrl) => request(baseUrl).get("/api/companies/company-1/heartbeat-runs"),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(400);
+    expect(mockHeartbeatService.list).not.toHaveBeenCalled();
+    expect(res.body).toEqual({ error: "limit is required and must be a positive integer" });
+  });
+
+  it("caps heartbeat run list polling at 200", async () => {
+    const res = await requestApp(
+      await createApp(),
+      (baseUrl) => request(baseUrl).get("/api/companies/company-1/heartbeat-runs?limit=500"),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(400);
+    expect(mockHeartbeatService.list).not.toHaveBeenCalled();
+    expect(res.body).toEqual({ error: "limit is required and must be a positive integer" });
   });
 
   it("passes scoped wake fields through the legacy heartbeat invoke route", async () => {

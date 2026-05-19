@@ -230,6 +230,7 @@ const MAX_TURN_CONTINUATION_MAX_ATTEMPTS_CAP = 10;
 const MAX_TURN_CONTINUATION_DEFAULT_DELAY_MS = 1_000;
 const MAX_TURN_CONTINUATION_MAX_DELAY_MS = 5 * 60 * 1000;
 const MAX_TURN_CONTINUATION_LIVE_RUN_STATUSES = ["scheduled_retry", "queued", "running"] as const;
+const HEARTBEAT_RUN_LIST_LIMIT_MAX = 200;
 type CodexTransientFallbackMode =
   | "same_session"
   | "safer_invocation"
@@ -9842,7 +9843,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   return {
-    list: async (companyId: string, agentId?: string, limit?: number) => {
+    list: async (companyId: string, agentId?: string, limit: number = HEARTBEAT_RUN_LIST_LIMIT_MAX) => {
+      if (!Number.isInteger(limit) || limit <= 0 || limit > HEARTBEAT_RUN_LIST_LIMIT_MAX) {
+        throw new Error(`limit must be a positive integer no greater than ${HEARTBEAT_RUN_LIST_LIMIT_MAX}`);
+      }
       const safeForLegacyEncoding = await hasUnsafeTextProjectionDatabase();
       const query = db
         .select(
@@ -9850,11 +9854,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             ? {
                 ...heartbeatRunListColumns,
                 error: sql<string | null>`NULL`.as("error"),
-                ...heartbeatRunListContextColumns,
               }
             : {
                 ...heartbeatRunListColumns,
-                ...heartbeatRunListContextColumns,
                 ...heartbeatRunListResultColumns,
               },
         )
@@ -9866,17 +9868,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         )
         .orderBy(desc(heartbeatRuns.createdAt));
 
-      const rows = limit ? await query.limit(limit) : await query;
+      const rows = await query.limit(limit);
       return rows.map((row) => {
         const {
-          contextIssueId,
-          contextTaskId,
-          contextTaskKey,
-          contextCommentId,
-          contextWakeCommentId,
-          contextWakeReason,
-          contextWakeSource,
-          contextWakeTriggerDetail,
           resultSummary,
           resultResult,
           resultMessage,
@@ -9897,16 +9891,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
         return {
           ...rest,
-          contextSnapshot: summarizeHeartbeatRunContextSnapshot({
-            issueId: contextIssueId,
-            taskId: contextTaskId,
-            taskKey: contextTaskKey,
-            commentId: contextCommentId,
-            wakeCommentId: contextWakeCommentId,
-            wakeReason: contextWakeReason,
-            wakeSource: contextWakeSource,
-            wakeTriggerDetail: contextWakeTriggerDetail,
-          }),
+          contextSnapshot: null,
           resultJson: safeForLegacyEncoding
             ? null
             : summarizeHeartbeatRunListResultJson({
