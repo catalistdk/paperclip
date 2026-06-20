@@ -169,16 +169,28 @@ export class P0AlertService {
 
     const escalated = tier === "urgent";
     const url = `https://api.telegram.org/bot${encodeURIComponent(this.config.telegramBotToken)}/sendMessage`;
-    await this.fetchImpl(url, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        chat_id: this.config.telegramChatId,
-        text: formatP0AlertMessage(input, { tier }),
-        parse_mode: "Markdown",
-        disable_web_page_preview: true,
-      }),
-    });
+    const text = formatP0AlertMessage(input, { tier });
+    const post = (parseMode: boolean) =>
+      this.fetchImpl(url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          chat_id: this.config.telegramChatId,
+          text,
+          ...(parseMode ? { parse_mode: "Markdown" } : {}),
+          disable_web_page_preview: true,
+        }),
+      });
+    // A stray Markdown entity char in a dynamic title/body (e.g. the underscore
+    // in BOARD_KEY "...") makes Telegram return 400 "can't parse entities" and
+    // silently drops the alert — this is what swallowed the board-key-expiry
+    // alarm on 2026-06-16. Retry as plain text on any non-OK response so a P0 /
+    // expiry alarm is never lost. Messages are near-plain (only the urgent-tier
+    // header uses *bold*), so the plain retry loses nothing material.
+    const response = await post(true);
+    if (response?.ok === false) {
+      await post(false);
+    }
     if (tier === "urgent") state.urgentTelegramSentAt = this.now();
     else state.standardTelegramSentAt = this.now();
     return {

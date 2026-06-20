@@ -41,6 +41,11 @@ import { createPluginWorkerManager } from "./services/plugin-worker-manager.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
 import { getBoardClaimWarningUrl, initializeBoardClaimChallenge } from "./board-claim.js";
+import {
+  tickBoardKeyExpiry,
+  createFileBackedBoardKeyDedupeStore,
+} from "./services/board-key-expiry-alarm.js";
+import { P0AlertService, loadP0AlertConfigFromEnv } from "./services/p0-alerts.js";
 import { maybePersistWorktreeRuntimePorts } from "./worktree-config.js";
 import { initTelemetry, getTelemetryClient } from "./telemetry.js";
 import { conflict } from "./errors.js";
@@ -803,6 +808,30 @@ export async function startServer(): Promise<StartedServer> {
     }, backupIntervalMs);
   }
   
+  if (config.boardKeyExpiryAlertEnabled) {
+    const boardKeyAlertService = new P0AlertService({ config: loadP0AlertConfigFromEnv() });
+    const boardKeyDedupeStore = createFileBackedBoardKeyDedupeStore();
+
+    const runBoardKeyExpiryCheck = () => {
+      void tickBoardKeyExpiry({
+        db: db as any,
+        alertSink: boardKeyAlertService,
+        dedupeStore: boardKeyDedupeStore,
+        logger,
+      }).then((result) => {
+        if (result.alerted > 0) {
+          logger.warn({ ...result }, "BOARD_KEY expiry check: alerts fired");
+        }
+      }).catch((err) => {
+        logger.error({ err }, "BOARD_KEY expiry check failed");
+      });
+    };
+
+    // Fire once immediately at startup so the first alert is not delayed up to 1h.
+    runBoardKeyExpiryCheck();
+    setInterval(runBoardKeyExpiryCheck, config.boardKeyExpiryAlertIntervalMs);
+  }
+
   // Wait for external adapters to finish loading before accepting requests.
   // Without this, adapter type validation (assertKnownAdapterType) would
   // reject valid external adapter types during the startup loading window.
