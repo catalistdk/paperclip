@@ -5,10 +5,12 @@ import { codexLocalUIAdapter } from "./codex-local";
 import { cursorCloudUIAdapter } from "./cursor-cloud";
 import { cursorLocalUIAdapter } from "./cursor";
 import { geminiLocalUIAdapter } from "./gemini-local";
+import { grokLocalUIAdapter } from "./grok-local";
+import { hermesGatewayUIAdapter } from "./hermes-gateway";
+import { hermesLocalUIAdapter } from "./hermes-local";
 import { openCodeLocalUIAdapter } from "./opencode-local";
 import { piLocalUIAdapter } from "./pi-local";
 import { openClawGatewayUIAdapter } from "./openclaw-gateway";
-import { hermesLocalUIAdapter } from "./hermes-local";
 import { processUIAdapter } from "./process";
 import { httpUIAdapter } from "./http";
 import { loadDynamicParser, invalidateDynamicParser, setDynamicParserResultNotifier } from "./dynamic-loader";
@@ -56,6 +58,8 @@ function registerBuiltInUIAdapters() {
     codexLocalUIAdapter,
     cursorCloudUIAdapter,
     geminiLocalUIAdapter,
+    grokLocalUIAdapter,
+    hermesGatewayUIAdapter,
     hermesLocalUIAdapter,
     openCodeLocalUIAdapter,
     piLocalUIAdapter,
